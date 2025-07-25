@@ -76,6 +76,9 @@ shared (deployer) actor class SneedLock() = this {
   stable var info_log : CircularBuffer = CircularBuffer.CircularBufferLogic.create(10_000);
   stable var next_correlation_id : Nat = 0;
 
+  let admin = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
+  let sneed_governance = Principal.fromText("fi3zi-fyaaa-aaaaq-aachq-cai");
+
   let icrc1_sneed_ledger_canister_id = Principal.fromText("hvgxa-wqaaa-aaaaq-aacia-cai");
   let sneed_defi_canister_id = Principal.fromText("ok64y-uiaaa-aaaag-qdcbq-cai");
 
@@ -1064,7 +1067,7 @@ shared (deployer) actor class SneedLock() = this {
   ////////////////
   //
   public shared ({ caller }) func admin_return_token(icrc1_ledger_canister_id: Principal, amount: Nat, user_principal : Principal) : async TransferResult {
-    if (caller != Principal.fromText("fi3zi-fyaaa-aaaaq-aachq-cai") and caller != Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae")) {
+    if (caller != sneed_governance and caller != admin) {
       Debug.trap("Only the SNEED governance or Admin can return tokens.");
     };
 
@@ -1092,7 +1095,7 @@ shared (deployer) actor class SneedLock() = this {
 
 
   public shared ({ caller }) func set_token_lock_fee_sneed_e8s(new_token_lock_fee_sneed_e8s: Nat) : async SetLockFeeResult {    
-    if (caller != Principal.fromText("fi3zi-fyaaa-aaaaq-aachq-cai")) {
+    if (caller != sneed_governance and caller != admin) {
       return #Err("Only the SNEED governance can set the lock fee");
     };
 
@@ -1106,7 +1109,7 @@ shared (deployer) actor class SneedLock() = this {
   };
 
   public shared ({ caller }) func set_max_lock_length_days(new_max_lock_length_days: Nat64) : async () {    
-    if (caller != Principal.fromText("fi3zi-fyaaa-aaaaq-aachq-cai")) {
+    if (caller != sneed_governance and caller != admin) {
       Debug.trap("Only the SNEED governance can set the max lock length.");
     };
 

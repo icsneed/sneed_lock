@@ -1706,9 +1706,37 @@ shared (deployer) persistent actor class SneedLock() = this {
     // Step 3: Withdraw to caller's subaccount
     let caller_subaccount = PrincipalToSubaccount(request.caller);
 
-    // Withdraw token0 if amount > fee (need to subtract fee from claimed amount)
-    if (amount0_claimed > token0_fee) {
-      let withdraw0_amount = amount0_claimed - token0_fee;
+    // Query actual balance after claim to verify amounts available
+    let balance_after_claim = await swap_canister.getUserUnusedBalance(this_canister_id());
+    let (balance0_after_claim, balance1_after_claim) = switch (balance_after_claim) {
+      case (#ok(balances)) { 
+        log_info(request.caller, correlation_id, "Balance after claim: token0=" # debug_show(balances.balance0) # " (claimed: " # debug_show(amount0_claimed) # "), token1=" # debug_show(balances.balance1) # " (claimed: " # debug_show(amount1_claimed) # ")");
+        
+        // Check for discrepancies (ICPSwap claim might consume fees)
+        if (balances.balance0 != amount0_claimed) {
+          log_info(request.caller, correlation_id, "NOTE: Token0 balance (" # debug_show(balances.balance0) # ") differs from claimed amount (" # debug_show(amount0_claimed) # "), difference: " # debug_show(if (amount0_claimed > balances.balance0) { amount0_claimed - balances.balance0 } else { 0 }));
+        };
+        if (balances.balance1 != amount1_claimed) {
+          log_info(request.caller, correlation_id, "NOTE: Token1 balance (" # debug_show(balances.balance1) # ") differs from claimed amount (" # debug_show(amount1_claimed) # "), difference: " # debug_show(if (amount1_claimed > balances.balance1) { amount1_claimed - balances.balance1 } else { 0 }));
+        };
+        
+        (balances.balance0, balances.balance1) 
+      };
+      case (#err(err)) {
+        let error_msg = "Failed to get balance after claim: " # debug_show(err);
+        log_error(request.caller, correlation_id, error_msg);
+        let failed_request = { updated_request_verified with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+        archive_completed_request(failed_request);
+        return;
+      };
+    };
+
+    // Withdraw token0 if balance is sufficient
+    // Use actual available balance instead of claimed amount, as claim might consume fees
+    if (balance0_after_claim > token0_fee) {
+      let withdraw0_amount = balance0_after_claim - token0_fee;
+      log_info(request.caller, correlation_id, "Attempting to withdraw token0: amount=" # debug_show(withdraw0_amount) # ", fee=" # debug_show(token0_fee) # ", total_needed=" # debug_show(balance0_after_claim) # ", available_balance=" # debug_show(balance0_after_claim) # ", claimed_was=" # debug_show(amount0_claimed));
+      
       let withdraw0_result = await swap_canister.withdrawToSubaccount({
         amount = withdraw0_amount;
         fee = token0_fee;
@@ -1727,13 +1755,16 @@ shared (deployer) persistent actor class SneedLock() = this {
           return;
         };
       };
-    } else if (amount0_claimed > 0) {
-      log_info(request.caller, correlation_id, "Token0 claimed amount (" # debug_show(amount0_claimed) # ") <= fee (" # debug_show(token0_fee) # "), skipping withdrawal");
+    } else if (balance0_after_claim > 0) {
+      log_info(request.caller, correlation_id, "Token0 available balance (" # debug_show(balance0_after_claim) # ") <= fee (" # debug_show(token0_fee) # "), skipping withdrawal (claimed was " # debug_show(amount0_claimed) # ")");
     };
 
-    // Withdraw token1 if amount > fee (need to subtract fee from claimed amount)
-    if (amount1_claimed > token1_fee) {
-      let withdraw1_amount = amount1_claimed - token1_fee;
+    // Withdraw token1 if balance is sufficient
+    // Use actual available balance instead of claimed amount, as claim might consume fees
+    if (balance1_after_claim > token1_fee) {
+      let withdraw1_amount = balance1_after_claim - token1_fee;
+      log_info(request.caller, correlation_id, "Attempting to withdraw token1: amount=" # debug_show(withdraw1_amount) # ", fee=" # debug_show(token1_fee) # ", total_needed=" # debug_show(balance1_after_claim) # ", available_balance=" # debug_show(balance1_after_claim) # ", claimed_was=" # debug_show(amount1_claimed));
+      
       let withdraw1_result = await swap_canister.withdrawToSubaccount({
         amount = withdraw1_amount;
         fee = token1_fee;
@@ -1752,8 +1783,8 @@ shared (deployer) persistent actor class SneedLock() = this {
           return;
         };
       };
-    } else if (amount1_claimed > 0) {
-      log_info(request.caller, correlation_id, "Token1 claimed amount (" # debug_show(amount1_claimed) # ") <= fee (" # debug_show(token1_fee) # "), skipping withdrawal");
+    } else if (balance1_after_claim > 0) {
+      log_info(request.caller, correlation_id, "Token1 available balance (" # debug_show(balance1_after_claim) # ") <= fee (" # debug_show(token1_fee) # "), skipping withdrawal (claimed was " # debug_show(amount1_claimed) # ")");
     };
 
     // Mark as completed

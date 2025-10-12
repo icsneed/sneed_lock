@@ -19,6 +19,32 @@ import CircularBuffer "CircularBuffer";
 
 // TODO: figure out when new instances of actors are created, whether or not that depends on the client at all, and how this effects the persistent state of the actor.
 //       https://internetcomputer.org/docs/current/motoko/main/writing-motoko/actor-classes
+
+// Migration expression to handle stable variable type changes
+(with migration = func (old : { var stable_claim_requests : [T.ClaimRequestV1] }) : { var stable_claim_requests : [T.ClaimRequest] } {
+  {
+    var stable_claim_requests = Array.map<T.ClaimRequestV1, T.ClaimRequest>(
+      old.stable_claim_requests,
+      func (oldReq : T.ClaimRequestV1) : T.ClaimRequest {
+        {
+          request_id = oldReq.request_id;
+          caller = oldReq.caller;
+          swap_canister_id = oldReq.swap_canister_id;
+          position_id = oldReq.position_id;
+          token0 = oldReq.token0;
+          token1 = oldReq.token1;
+          status = oldReq.status;
+          created_at = oldReq.created_at;
+          started_processing_at = oldReq.started_processing_at;
+          completed_at = oldReq.completed_at;
+          retry_count = 0;  // Initialize new field to 0
+          last_attempted_at = null;  // Initialize new field to null
+        }
+      }
+    );
+  }
+})
+
 shared (deployer) persistent actor class SneedLock() = this {
 
   ////////////////
@@ -61,6 +87,7 @@ shared (deployer) persistent actor class SneedLock() = this {
   type TransferTokenLockOwnershipError = T.TransferTokenLockOwnershipError;
   type ClaimRequestId = T.ClaimRequestId;
   type ClaimRequestStatus = T.ClaimRequestStatus;
+  type ClaimRequestV1 = T.ClaimRequestV1;  // Old version for migration
   type ClaimRequest = T.ClaimRequest;
   type ClaimAndWithdrawResult = T.ClaimAndWithdrawResult;
   type QueueProcessingState = T.QueueProcessingState;

@@ -187,6 +187,21 @@ module {
         #TimedOut;
     };
 
+    // Old version for migration (can be removed after successful upgrade)
+    public type ClaimRequestV1 = {
+        request_id: ClaimRequestId;
+        caller: Principal;
+        swap_canister_id: SwapCanisterId;
+        position_id: PositionId;
+        token0: TokenType;
+        token1: TokenType;
+        status: ClaimRequestStatus;
+        created_at: Timestamp;
+        started_processing_at: ?Timestamp;
+        completed_at: ?Timestamp;
+    };
+
+    // New version with retry tracking
     public type ClaimRequest = {
         request_id: ClaimRequestId;
         caller: Principal;

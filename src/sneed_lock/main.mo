@@ -92,7 +92,8 @@ shared (deployer) persistent actor class SneedLock() = this {
   stable var next_correlation_id : Nat = 0;
   
   // Claim queue stable state
-  stable var stable_claim_requests : StableClaimRequests = [];
+  stable var stable_claim_requests : StableClaimRequests = []; // Active requests (pending/processing)
+  stable var completed_claim_requests_buffer : CircularBuffer = CircularBuffer.CircularBufferLogic.create(1_000); // Completed requests circular buffer
   stable var next_claim_request_id : Nat = 0;
   stable var claim_queue_processing_state : QueueProcessingState = #Active;
   stable var claim_processing_timer_id : ?Nat = null;
@@ -1385,6 +1386,22 @@ shared (deployer) persistent actor class SneedLock() = this {
     };
   };
 
+  // Helper: Move completed request to circular buffer and remove from active
+  private func archive_completed_request(request : ClaimRequest) : () {
+    // Add to completed buffer
+    CircularBuffer.CircularBufferLogic.add(
+      completed_claim_requests_buffer,
+      request.request_id,
+      request.caller,
+      debug_show(request)
+    );
+
+    // Remove from active requests
+    stable_claim_requests := Array.filter<ClaimRequest>(stable_claim_requests, func (req) {
+      req.request_id != request.request_id
+    });
+  };
+
   // Public: Request claim and withdraw
   public shared ({ caller }) func request_claim_and_withdraw(
     swap_canister_id : T.SwapCanisterId,
@@ -1488,7 +1505,7 @@ shared (deployer) persistent actor class SneedLock() = this {
             started_processing_at = request.started_processing_at;
             completed_at = ?TimeAsNat64(Time.now());
           };
-          update_claim_request(updated_request);
+          archive_completed_request(updated_request);
           log_error(request.caller, correlation_id, "Request " # debug_show(request.request_id) # " timed out");
           
           // Pause processing
@@ -1560,7 +1577,7 @@ shared (deployer) persistent actor class SneedLock() = this {
         let error_msg = "Failed to get balance before claim: " # debug_show(err);
         log_error(request.caller, correlation_id, error_msg);
         let failed_request = { request with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-        update_claim_request(failed_request);
+        archive_completed_request(failed_request);
         return;
       };
     };
@@ -1604,7 +1621,7 @@ shared (deployer) persistent actor class SneedLock() = this {
               let error_msg = "Claim failed and balance unchanged: " # debug_show(err);
               log_error(request.caller, correlation_id, error_msg);
               let failed_request = { updated_request_claim_attempted with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-              update_claim_request(failed_request);
+              archive_completed_request(failed_request);
               return;
             } else {
               // Balance changed, claim succeeded despite error
@@ -1616,7 +1633,7 @@ shared (deployer) persistent actor class SneedLock() = this {
             let error_msg = "Failed to verify balance after claim error: " # debug_show(balance_err);
             log_error(request.caller, correlation_id, error_msg);
             let failed_request = { updated_request_claim_attempted with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-            update_claim_request(failed_request);
+            archive_completed_request(failed_request);
             return;
           };
         };
@@ -1659,7 +1676,7 @@ shared (deployer) persistent actor class SneedLock() = this {
           let error_msg = "Failed to withdraw token0: " # debug_show(err);
           log_error(request.caller, correlation_id, error_msg);
           let failed_request = { updated_request_verified with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-          update_claim_request(failed_request);
+          archive_completed_request(failed_request);
           return;
         };
       };
@@ -1681,7 +1698,7 @@ shared (deployer) persistent actor class SneedLock() = this {
           let error_msg = "Failed to withdraw token1: " # debug_show(err);
           log_error(request.caller, correlation_id, error_msg);
           let failed_request = { updated_request_verified with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-          update_claim_request(failed_request);
+          archive_completed_request(failed_request);
           return;
         };
       };
@@ -1693,18 +1710,28 @@ shared (deployer) persistent actor class SneedLock() = this {
       status = #Completed;
       completed_at = ?TimeAsNat64(Time.now());
     };
-    update_claim_request(completed_request);
+    archive_completed_request(completed_request);
     log_info(request.caller, correlation_id, "Completed claim request " # debug_show(request.request_id));
   };
 
-  // Query: Get all claim requests for caller
-  public query ({ caller }) func get_my_claim_requests() : async [ClaimRequest] {
+  // Query: Get all active claim requests for caller (pending/processing)
+  public query ({ caller }) func get_my_active_claim_requests() : async [ClaimRequest] {
     Array.filter<ClaimRequest>(stable_claim_requests, func (req) { req.caller == caller });
   };
 
-  // Query: Get claim request by ID
-  public query func get_claim_request(request_id : ClaimRequestId) : async ?ClaimRequest {
+  // Query: Get active claim request by ID (pending/processing)
+  public query func get_active_claim_request(request_id : ClaimRequestId) : async ?ClaimRequest {
     Array.find<ClaimRequest>(stable_claim_requests, func (req) { req.request_id == request_id });
+  };
+
+  // Query: Get completed claim requests from circular buffer
+  public query func get_completed_claim_requests(start: Nat, length: Nat) : async [?BufferEntry] {
+    CircularBuffer.CircularBufferLogic.get_entries_by_id(completed_claim_requests_buffer, start, length);
+  };
+
+  // Query: Get completed claim requests ID range
+  public query func get_completed_claim_requests_id_range() : async ?(Nat, Nat) {
+    CircularBuffer.CircularBufferLogic.get_id_range(completed_claim_requests_buffer);
   };
 
   // Query: Get queue status
@@ -1712,14 +1739,11 @@ shared (deployer) persistent actor class SneedLock() = this {
     processing_state : QueueProcessingState;
     pending_count : Nat;
     processing_count : Nat;
-    completed_count : Nat;
-    failed_count : Nat;
-    total_count : Nat;
+    active_total : Nat;
+    completed_buffer_count : Nat;
   } {
     var pending = 0;
     var processing = 0;
-    var completed = 0;
-    var failed = 0;
 
     for (req in stable_claim_requests.vals()) {
       switch (req.status) {
@@ -1729,9 +1753,7 @@ shared (deployer) persistent actor class SneedLock() = this {
         case (#ClaimAttempted(_)) { processing += 1; };
         case (#ClaimVerified(_)) { processing += 1; };
         case (#Withdrawn(_)) { processing += 1; };
-        case (#Completed) { completed += 1; };
-        case (#Failed(_)) { failed += 1; };
-        case (#TimedOut) { failed += 1; };
+        case _ {}; // Should not have completed/failed in active array
       };
     };
 
@@ -1739,9 +1761,8 @@ shared (deployer) persistent actor class SneedLock() = this {
       processing_state = claim_queue_processing_state;
       pending_count = pending;
       processing_count = processing;
-      completed_count = completed;
-      failed_count = failed;
-      total_count = stable_claim_requests.size();
+      active_total = stable_claim_requests.size();
+      completed_buffer_count = completed_claim_requests_buffer.count;
     };
   };
 
@@ -1780,32 +1801,23 @@ shared (deployer) persistent actor class SneedLock() = this {
     };
   };
 
-  // Admin: Clear completed/failed requests
-  public shared ({ caller }) func admin_clear_completed_claim_requests() : async Nat {
+  // Admin: Clear completed requests circular buffer
+  public shared ({ caller }) func admin_clear_completed_claim_requests_buffer() : async Nat {
     if (caller != sneed_governance and caller != admin) {
-      Debug.trap("Only admin can clear completed requests");
+      Debug.trap("Only admin can clear completed requests buffer");
     };
 
-    let before_count = stable_claim_requests.size();
-    stable_claim_requests := Array.filter<ClaimRequest>(stable_claim_requests, func (req) {
-      switch (req.status) {
-        case (#Completed) { false };
-        case (#Failed(_)) { false };
-        case (#TimedOut) { false };
-        case _ { true };
-      };
-    });
-    let after_count = stable_claim_requests.size();
-    let cleared = before_count - after_count;
+    let before_count = completed_claim_requests_buffer.count;
+    completed_claim_requests_buffer := CircularBuffer.CircularBufferLogic.create(1_000);
 
     let correlation_id = get_next_correlation_id();
-    log_info(caller, correlation_id, "Cleared " # debug_show(cleared) # " completed/failed claim requests");
+    log_info(caller, correlation_id, "Cleared completed claim requests buffer, removed " # debug_show(before_count) # " entries");
     
-    cleared;
+    before_count;
   };
 
-  // Admin: Remove specific request
-  public shared ({ caller }) func admin_remove_claim_request(request_id : ClaimRequestId) : async Bool {
+  // Admin: Remove specific active request (pending/processing only)
+  public shared ({ caller }) func admin_remove_active_claim_request(request_id : ClaimRequestId) : async Bool {
     if (caller != sneed_governance and caller != admin) {
       Debug.trap("Only admin can remove claim requests");
     };
@@ -1819,7 +1831,7 @@ shared (deployer) persistent actor class SneedLock() = this {
     let removed = before_count != after_count;
     if (removed) {
       let correlation_id = get_next_correlation_id();
-      log_info(caller, correlation_id, "Removed claim request " # debug_show(request_id));
+      log_info(caller, correlation_id, "Removed active claim request " # debug_show(request_id));
     };
     
     removed;

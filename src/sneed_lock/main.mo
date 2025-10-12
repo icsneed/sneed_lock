@@ -546,7 +546,7 @@ shared (deployer) actor class SneedLock() = this {
     #Ok;
   };
 
-  private func find_and_remove_token_lock(principal : Principal, token_type : T.TokenType, lock_id : T.LockId) : ?Lock {
+  private func find_token_lock(principal : Principal, token_type : T.TokenType, lock_id : T.LockId) : ?Lock {
     let allLocks = switch (state.principal_token_locks.get(principal)) {
       case (?_tokenLocks) _tokenLocks;
       case _ HashMap.HashMap<TokenType, Locks>(10, Principal.equal, Principal.hash);
@@ -566,17 +566,23 @@ shared (deployer) actor class SneedLock() = this {
       };
     };
 
-    // Remove the lock from the list if found
-    switch (foundLock) {
-      case (?lock) {
-        let filteredLocks = List.filter<Lock>(locks, func (l) { l.lock_id != lock_id; });
-        allLocks.put(token_type, filteredLocks);
-        state.principal_token_locks.put(principal, allLocks);
-      };
-      case null {};
+    foundLock;
+  };
+
+  private func remove_token_lock(principal : Principal, token_type : T.TokenType, lock_id : T.LockId) : () {
+    let allLocks = switch (state.principal_token_locks.get(principal)) {
+      case (?_tokenLocks) _tokenLocks;
+      case _ HashMap.HashMap<TokenType, Locks>(10, Principal.equal, Principal.hash);
     };
 
-    foundLock;
+    let locks = switch (allLocks.get(token_type)) {
+      case (?existingLocks) existingLocks;
+      case _ List.nil<Lock>();
+    };
+
+    let filteredLocks = List.filter<Lock>(locks, func (l) { l.lock_id != lock_id; });
+    allLocks.put(token_type, filteredLocks);
+    state.principal_token_locks.put(principal, allLocks);
   };
 
   public shared ({ caller }) func transfer_token_lock_ownership(
@@ -587,8 +593,8 @@ shared (deployer) actor class SneedLock() = this {
     let correlation_id = get_next_correlation_id();
     log_info(caller, correlation_id, "Transferring token lock " # debug_show(lock_id) # " from " # debug_show(caller) # " to " # debug_show(to_principal) # " for token " # debug_show(token_type));
 
-    // Find and remove the lock from the caller
-    let lock = find_and_remove_token_lock(caller, token_type, lock_id);
+    // Find the lock (without removing it yet)
+    let lock = find_token_lock(caller, token_type, lock_id);
 
     switch (lock) {
       case null {
@@ -603,8 +609,6 @@ shared (deployer) actor class SneedLock() = this {
         // Verify the lock hasn't expired
         let now = NowAsNat64();
         if (found_lock.expiry <= now) {
-          // Re-add the lock back since it was removed
-          add_lock_for_principal(caller, token_type, found_lock);
           let error = #Err({
             message = "Lock " # debug_show(lock_id) # " has expired. Expiry: " # debug_show(found_lock.expiry) # ", Now: " # debug_show(now);
             transfer_error = null;
@@ -613,7 +617,7 @@ shared (deployer) actor class SneedLock() = this {
           return error;
         };
 
-        // Verify the caller's subaccount has the locked balance
+        // Verify the caller's subaccount has the locked balance BEFORE making any mutations
         let icrc1_ledger_canister = actor (Principal.toText(token_type)) : actor {
           icrc1_transfer(args : TransferArgs) : async T.TransferResult;
           icrc1_balance_of(account : Account) : async Nat;
@@ -625,8 +629,6 @@ shared (deployer) actor class SneedLock() = this {
         let caller_balance = await icrc1_ledger_canister.icrc1_balance_of(caller_account);
 
         if (caller_balance < found_lock.amount) {
-          // Re-add the lock back since verification failed
-          add_lock_for_principal(caller, token_type, found_lock);
           let error = #Err({
             message = "Insufficient balance in caller's subaccount. Has: " # Nat.toText(caller_balance) # ", Required: " # Nat.toText(found_lock.amount);
             transfer_error = null;
@@ -634,6 +636,10 @@ shared (deployer) actor class SneedLock() = this {
           log_error(caller, correlation_id, debug_show(error));
           return error;
         };
+
+        // All validations passed - now remove the lock from the caller
+        remove_token_lock(caller, token_type, lock_id);
+        log_info(caller, correlation_id, "Removed lock " # debug_show(lock_id) # " from " # debug_show(caller));
 
         // Transfer the tokens from caller's subaccount to recipient's subaccount
         let recipient_subaccount = PrincipalToSubaccount(to_principal);
@@ -652,7 +658,7 @@ shared (deployer) actor class SneedLock() = this {
 
         switch (transfer_result) {
           case (#Err(transfer_error)) {
-            // Re-add the lock back since transfer failed
+            // Re-add the lock back to caller since transfer failed
             add_lock_for_principal(caller, token_type, found_lock);
             let error = #Err({
               message = "Failed to transfer tokens from caller's subaccount to recipient's subaccount";

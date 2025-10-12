@@ -2443,8 +2443,146 @@ shared (deployer) persistent actor class SneedLock() = this {
     };
   };
 
+  // Admin: Manually withdraw by providing request details directly
+  // Use this when request is archived in completed/failed buffers
+  public shared ({ caller }) func admin_manual_withdraw(
+    swap_canister_id : T.SwapCanisterId,
+    token0 : TokenType,
+    token1 : TokenType,
+    original_caller : Principal
+  ) : async {
+    #Ok : Text;
+    #Err : Text;
+  } {
+    if (not isAdmin(caller)) {
+      Debug.trap("Only admin can manually withdraw");
+    };
+
+    let correlation_id = get_next_correlation_id();
+    log_info(caller, correlation_id, "Admin manual withdraw for caller=" # debug_show(original_caller) # ", swap=" # debug_show(swap_canister_id));
+
+    // Get ICPSwap swap canister actor
+    let swap_canister = actor (Principal.toText(swap_canister_id)) : actor {
+      getUserUnusedBalance : (principal : Principal) -> async { #ok : { balance0 : Nat; balance1 : Nat }; #err : T.SwapCanisterError };
+      withdrawToSubaccount : (args : {
+        amount : Nat;
+        fee : Nat;
+        subaccount : Blob;
+        token : Text;
+      }) -> async { #ok : Nat; #err : T.SwapCanisterError };
+    };
+    
+    // Get token ledger actors
+    let token0_ledger = actor (Principal.toText(token0)) : actor { icrc1_fee : () -> async Nat };
+    let token1_ledger = actor (Principal.toText(token1)) : actor { icrc1_fee : () -> async Nat };
+    
+    let token0_fee = await token0_ledger.icrc1_fee();
+    let token1_fee = await token1_ledger.icrc1_fee();
+
+    log_info(caller, correlation_id, "Token fees: token0=" # debug_show(token0_fee) # ", token1=" # debug_show(token1_fee));
+
+    // Get current backend balance on swap canister
+    let balance_result = await swap_canister.getUserUnusedBalance(this_canister_id());
+    let (balance0, balance1) = switch (balance_result) {
+      case (#ok(balances)) { (balances.balance0, balances.balance1) };
+      case (#err(err)) {
+        let msg = "Failed to get backend balance: " # debug_show(err);
+        log_error(caller, correlation_id, msg);
+        return #Err(msg);
+      };
+    };
+
+    log_info(caller, correlation_id, "Current backend balance: token0=" # debug_show(balance0) # ", token1=" # debug_show(balance1));
+
+    // Check if there's anything to withdraw
+    if (balance0 <= token0_fee and balance1 <= token1_fee) {
+      let msg = "Nothing to withdraw. Token0 balance (" # debug_show(balance0) # ") <= fee (" # debug_show(token0_fee) # "), Token1 balance (" # debug_show(balance1) # ") <= fee (" # debug_show(token1_fee) # ")";
+      log_info(caller, correlation_id, msg);
+      return #Ok(msg);
+    };
+
+    // Calculate subaccount for the original caller
+    let caller_subaccount = PrincipalToSubaccount(original_caller);
+
+    var withdrawn0 : Balance = 0;
+    var withdrawn1 : Balance = 0;
+    var errors : Text = "";
+
+    // Attempt to withdraw token0 if balance is sufficient (withdraw balance minus one fee)
+    if (balance0 > token0_fee) {
+      let withdraw0_amount = balance0 - token0_fee;
+      log_info(caller, correlation_id, "Attempting to withdraw token0: amount=" # debug_show(withdraw0_amount) # ", fee=" # debug_show(token0_fee));
+      
+      let withdraw0_result = await swap_canister.withdrawToSubaccount({
+        amount = withdraw0_amount;
+        fee = token0_fee;
+        subaccount = Blob.fromArray(caller_subaccount);
+        token = Principal.toText(token0);
+      });
+      
+      switch (withdraw0_result) {
+        case (#ok(_)) {
+          withdrawn0 := withdraw0_amount;
+          log_info(caller, correlation_id, "Successfully withdrew token0: " # debug_show(withdraw0_amount));
+        };
+        case (#err(err)) {
+          let error_msg = "Failed to withdraw token0: " # debug_show(err);
+          log_error(caller, correlation_id, error_msg);
+          errors := errors # error_msg # "; ";
+        };
+      };
+    } else if (balance0 > 0) {
+      log_info(caller, correlation_id, "Token0 balance (" # debug_show(balance0) # ") <= fee (" # debug_show(token0_fee) # "), skipping");
+    };
+
+    // Attempt to withdraw token1 if balance is sufficient (withdraw balance minus one fee)
+    if (balance1 > token1_fee) {
+      let withdraw1_amount = balance1 - token1_fee;
+      log_info(caller, correlation_id, "Attempting to withdraw token1: amount=" # debug_show(withdraw1_amount) # ", fee=" # debug_show(token1_fee));
+      
+      let withdraw1_result = await swap_canister.withdrawToSubaccount({
+        amount = withdraw1_amount;
+        fee = token1_fee;
+        subaccount = Blob.fromArray(caller_subaccount);
+        token = Principal.toText(token1);
+      });
+      
+      switch (withdraw1_result) {
+        case (#ok(_)) {
+          withdrawn1 := withdraw1_amount;
+          log_info(caller, correlation_id, "Successfully withdrew token1: " # debug_show(withdraw1_amount));
+        };
+        case (#err(err)) {
+          let error_msg = "Failed to withdraw token1: " # debug_show(err);
+          log_error(caller, correlation_id, error_msg);
+          errors := errors # error_msg # "; ";
+        };
+      };
+    } else if (balance1 > 0) {
+      log_info(caller, correlation_id, "Token1 balance (" # debug_show(balance1) # ") <= fee (" # debug_show(token1_fee) # "), skipping");
+    };
+
+    // Return result
+    if (withdrawn0 > 0 or withdrawn1 > 0) {
+      if (errors == "") {
+        let success_msg = "Successfully withdrew: token0=" # debug_show(withdrawn0) # ", token1=" # debug_show(withdrawn1);
+        log_info(caller, correlation_id, success_msg);
+        #Ok(success_msg);
+      } else {
+        let partial_msg = "Partially withdrew: token0=" # debug_show(withdrawn0) # ", token1=" # debug_show(withdrawn1) # ". Errors: " # errors;
+        log_info(caller, correlation_id, partial_msg);
+        #Ok(partial_msg);
+      };
+    } else {
+      let fail_msg = "Failed to withdraw anything. Errors: " # errors;
+      log_error(caller, correlation_id, fail_msg);
+      #Err(fail_msg);
+    };
+  };
+
   // Admin: Manually withdraw stuck funds for a specific request
   // This rescues funds when claim succeeded but withdrawal failed
+  // Can work with requests in any state (active, completed, or failed)
   public shared ({ caller }) func admin_manual_withdraw_for_request(request_id : ClaimRequestId) : async {
     #Ok : Text;
     #Err : Text;
@@ -2456,15 +2594,60 @@ shared (deployer) persistent actor class SneedLock() = this {
     let correlation_id = get_next_correlation_id();
     log_info(caller, correlation_id, "Admin manual withdraw for request " # debug_show(request_id));
     
-    // Find the request in active requests
+    // Search in active requests first
     let request_opt = Array.find<ClaimRequest>(stable_claim_requests, func (req) {
       req.request_id == request_id
     });
 
-    let request = switch (request_opt) {
-      case (?req) { req };
+    let request : ClaimRequest = switch (request_opt) {
+      case (?req) { 
+        log_info(caller, correlation_id, "Found request in active requests");
+        req 
+      };
       case null {
-        let msg = "Request " # debug_show(request_id) # " not found in active requests. Cannot withdraw.";
+        // Not in active requests, search in completed buffer
+        let completed_entries = Array.freeze(CircularBuffer.CircularBufferLogic.to_array(completed_claim_requests_buffer));
+        var found_in_completed : ?BufferEntry = null;
+        
+        for (entry_opt in completed_entries.vals()) {
+          switch (entry_opt) {
+            case (?entry) {
+              if (entry.correlation_id == request_id) {
+                found_in_completed := ?entry;
+              };
+            };
+            case null {};
+          };
+        };
+        
+        switch (found_in_completed) {
+          case (?_entry) {
+            log_info(caller, correlation_id, "Found request in completed buffer, but cannot extract structured data from text. Searching failed buffer...");
+            // Continue to check failed buffer
+          };
+          case null {};
+        };
+        
+        // Search in failed buffer
+        let failed_entries = Array.freeze(CircularBuffer.CircularBufferLogic.to_array(failed_claim_requests_buffer));
+        var found_in_failed : ?BufferEntry = null;
+        
+        for (entry_opt in failed_entries.vals()) {
+          switch (entry_opt) {
+            case (?entry) {
+              if (entry.correlation_id == request_id) {
+                found_in_failed := ?entry;
+              };
+            };
+            case null {};
+          };
+        };
+        
+        let msg = "Request " # debug_show(request_id) # " not found in active requests. " #
+                  "Found in completed: " # debug_show(found_in_completed != null) # ", " #
+                  "Found in failed: " # debug_show(found_in_failed != null) # ". " #
+                  "Cannot withdraw from completed/failed buffers as request data is stored as text. " #
+                  "The request must be in active state or you need to use request details directly.";
         log_error(caller, correlation_id, msg);
         return #Err(msg);
       };

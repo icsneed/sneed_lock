@@ -1880,6 +1880,33 @@ shared (deployer) persistent actor class SneedLock() = this {
     };
   };
 
+  // Admin: Emergency stop - immediately cancel timer
+  public shared ({ caller }) func admin_emergency_stop_timer() : async () {
+    if (caller != sneed_governance and caller != admin) {
+      Debug.trap("Only admin can emergency stop timer");
+    };
+
+    let correlation_id = get_next_correlation_id();
+    
+    // Cancel timer immediately
+    switch (claim_processing_timer_id) {
+      case (?timer_id) {
+        Timer.cancelTimer(timer_id);
+        claim_processing_timer_id := null;
+        log_info(caller, correlation_id, "EMERGENCY STOP: Timer " # debug_show(timer_id) # " cancelled");
+      };
+      case null {
+        log_info(caller, correlation_id, "EMERGENCY STOP: No active timer to cancel");
+      };
+    };
+
+    // Pause queue processing
+    claim_queue_processing_state := #Paused("Emergency stop activated");
+    claim_requests_processed_in_batch := 0;
+    
+    log_info(caller, correlation_id, "EMERGENCY STOP: Queue processing paused, timer cancelled");
+  };
+
   // Admin: Clear completed requests circular buffer
   public shared ({ caller }) func admin_clear_completed_claim_requests_buffer() : async Nat {
     if (caller != sneed_governance and caller != admin) {

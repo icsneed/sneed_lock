@@ -355,7 +355,38 @@ Resumes processing from the oldest pending request.
 public shared ({ caller }) func admin_pause_claim_queue(reason : Text) : async ()
 ```
 
-Manually pause processing with a reason.
+Manually pause processing with a reason. Also cancels the active timer.
+
+### Emergency Stop Timer
+
+```motoko
+public shared ({ caller }) func admin_emergency_stop_timer() : async ()
+```
+
+**Emergency use only** - Immediately cancels the timer and pauses queue processing.
+
+**Purpose:**
+- Prevents infinite timer loops that could consume all canister cycles
+- Stops runaway processing immediately
+- Safe to call multiple times (idempotent)
+
+**What it does:**
+1. Cancels active timer immediately
+2. Sets timer_id to null
+3. Pauses queue with reason "Emergency stop activated"
+4. Resets batch counter
+5. Logs all actions
+
+**When to use:**
+- Timer is stuck in infinite loop
+- Excessive cycle consumption detected
+- Unexpected repeated timer callbacks
+- Need to immediately halt all processing
+
+**After emergency stop:**
+- Investigate root cause in logs
+- Fix any underlying issues
+- Call `admin_resume_claim_queue()` to restart (creates new timer)
 
 ### Clear Completed Buffer
 
@@ -420,6 +451,45 @@ const statusDisplay = {
   Failed: "❌ Failed",
   TimedOut: "⏱️ Request timed out"
 };
+```
+
+### For Admins - Monitoring
+
+**Signs that emergency stop might be needed:**
+
+1. **Excessive cycle consumption** - Canister cycles dropping rapidly
+2. **Repeated timer callbacks** - Same processing happening multiple times
+3. **Stuck in processing** - Request in same state for too long
+4. **Error logs flooding** - Same error repeating continuously
+5. **Queue state inconsistent** - Processing but timer_id is null or vice versa
+
+**Monitoring checklist:**
+```motoko
+// Check queue status
+let status = await get_claim_queue_status();
+
+// Check if timer is active (should match processing_state)
+// If processing_state = #Active but no requests completing → investigate
+
+// Check error logs for repeated errors
+let errors = await get_error_entries(start, length);
+
+// Check cycle balance
+// If dropping unusually fast → emergency stop may be needed
+```
+
+**Emergency stop procedure:**
+```motoko
+// 1. Immediately stop timer
+await admin_emergency_stop_timer();
+
+// 2. Check logs to understand what happened
+let errors = await get_error_entries(...);
+
+// 3. Fix root cause (if code change needed, upgrade canister)
+
+// 4. Resume when safe
+await admin_resume_claim_queue();
 ```
 
 ## Technical Details
@@ -502,6 +572,8 @@ label polling loop {
 4. **No direct ICPSwap transfers** - all withdrawals to subaccounts
 5. **Sequential processing** prevents fund commingling
 6. **Timeout protection** prevents infinite processing
+7. **Emergency stop** available to prevent cycle exhaustion from timer loops
+8. **Zero balance check** prevents fund commingling from incomplete withdrawals
 
 ## Support
 

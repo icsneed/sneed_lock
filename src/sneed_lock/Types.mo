@@ -198,6 +198,8 @@ module {
         created_at: Timestamp;
         started_processing_at: ?Timestamp;
         completed_at: ?Timestamp;
+        retry_count: Nat;
+        last_attempted_at: ?Timestamp;
     };
 
     public type ClaimAndWithdrawResult = {

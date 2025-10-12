@@ -78,6 +78,9 @@ shared (deployer) persistent actor class SneedLock() = this {
   transient let max_requests_per_batch : Nat = 10;
   transient let claim_request_timeout_ns : Nat64 = 30 * minute_ns; // 30 minutes
   transient let batch_pause_duration_ns : Nat64 = 10 * minute_ns; // 10 minutes
+  transient let claim_request_cooldown_ns : Nat64 = 5 * minute_ns; // 5 minutes cooldown between retry attempts
+  transient let max_claim_retry_attempts : Nat = 5; // Max retries before moving to failed buffer
+  transient let max_consecutive_empty_cycles : Nat = 3; // Pause after N empty processing cycles
 
   // stable memory
   stable var stableLocks : StableLocks = [];
@@ -94,13 +97,15 @@ shared (deployer) persistent actor class SneedLock() = this {
   // Claim queue stable state
   stable var stable_claim_requests : StableClaimRequests = []; // Active requests (pending/processing)
   stable var completed_claim_requests_buffer : CircularBuffer = CircularBuffer.CircularBufferLogic.create(1_000); // Completed requests circular buffer
+  stable var failed_claim_requests_buffer : CircularBuffer = CircularBuffer.CircularBufferLogic.create(1_000); // Failed requests circular buffer (pre-claim failures)
   stable var next_claim_request_id : Nat = 0;
   stable var claim_queue_processing_state : QueueProcessingState = #Active;
   stable var claim_requests_processed_in_batch : Nat = 0;
   stable var enforce_zero_balance_before_claim : Bool = true; // Safety check: balance must be 0 before claiming
   stable var last_timer_execution_time : ?T.Timestamp = null; // When timer last executed
   stable var last_timer_execution_correlation_id : ?Nat = null; // Correlation ID of last execution
-
+  stable var consecutive_empty_processing_cycles : Nat = 0; // Circuit breaker: track empty processing cycles
+ 
   // shouldn't be stable but is for legacy reasons. 
   stable var claim_processing_timer_id : ?Nat = null;
   
@@ -1356,16 +1361,58 @@ shared (deployer) persistent actor class SneedLock() = this {
 
   // Helper: Get oldest pending request
   private func get_oldest_pending_request() : ?ClaimRequest {
+    let now = TimeAsNat64(Time.now());
+    var skipped_swap_canisters : List.List<Principal> = List.nil();
+    
     for (request in stable_claim_requests.vals()) {
-      switch (request.status) {
-        case (#Pending) { return ?request; };
-        case (#Processing) { return ?request; };
-        case (#BalanceRecorded(_)) { return ?request; };
-        case (#ClaimAttempted(_)) { return ?request; };
-        case (#ClaimVerified(_)) { return ?request; };
-        case _ {}; // Skip completed, failed, or timed out
+      // Only consider requests that are in an active processing state
+      let is_processable_status = switch (request.status) {
+        case (#Pending) { true };
+        case (#Processing) { true };
+        case (#BalanceRecorded(_)) { true };
+        case (#ClaimAttempted(_)) { true };
+        case (#ClaimVerified(_)) { true };
+        case (#Withdrawn(_)) { true };
+        case _ { false }; // Skip completed, failed, or timed out
+      };
+      
+      if (not is_processable_status) {
+        // Skip this request entirely
+      } else {
+        // Check if swap canister has been skipped
+        let swap_canister_skipped = List.some<Principal>(
+          skipped_swap_canisters,
+          func (p) { Principal.equal(p, request.swap_canister_id) }
+        );
+        
+        if (swap_canister_skipped) {
+          // Skip this request, swap canister already flagged
+        } else {
+          // Check cooldown
+          let in_cooldown = switch (request.last_attempted_at) {
+            case (?last_attempt) {
+              let elapsed : Nat64 = if (now >= last_attempt) {
+                now - last_attempt
+              } else {
+                0 : Nat64 // Clock skew protection
+              };
+              elapsed < claim_request_cooldown_ns
+            };
+            case null { false }; // Never attempted, not in cooldown
+          };
+          
+          if (in_cooldown) {
+            // Skip this request and mark its swap canister as skipped
+            skipped_swap_canisters := List.push(request.swap_canister_id, skipped_swap_canisters);
+          } else {
+            // This request is processable!
+            return ?request;
+          };
+        };
       };
     };
+    
+    // No processable requests found
     null;
   };
 
@@ -1399,6 +1446,21 @@ shared (deployer) persistent actor class SneedLock() = this {
     // Add to completed buffer
     CircularBuffer.CircularBufferLogic.add(
       completed_claim_requests_buffer,
+      request.request_id,
+      request.caller,
+      debug_show(request)
+    );
+
+    // Remove from active requests
+    stable_claim_requests := Array.filter<ClaimRequest>(stable_claim_requests, func (req) {
+      req.request_id != request.request_id
+    });
+  };
+
+  private func archive_failed_request(request : ClaimRequest) : () {
+    // Add to failed buffer (for pre-claim failures where no funds are stuck)
+    CircularBuffer.CircularBufferLogic.add(
+      failed_claim_requests_buffer,
       request.request_id,
       request.caller,
       debug_show(request)
@@ -1449,6 +1511,8 @@ shared (deployer) persistent actor class SneedLock() = this {
       created_at = TimeAsNat64(Time.now());
       started_processing_at = null;
       completed_at = null;
+      retry_count = 0;
+      last_attempted_at = null;
     };
 
     // Add to queue
@@ -1498,12 +1562,40 @@ shared (deployer) persistent actor class SneedLock() = this {
     // Get oldest pending request
     switch (get_oldest_pending_request()) {
       case null {
-        // Queue is empty
-        log_info(Principal.fromText("2vxsx-fae"), correlation_id, "Claim queue is empty, stopping processor");
-        claim_processing_timer_id := null;
-        next_scheduled_timer_time := null;
-        claim_requests_processed_in_batch := 0;
-        return;
+        // No processable requests (either queue empty or all in cooldown)
+        // Check if there are any active requests at all
+        let has_active_requests = stable_claim_requests.size() > 0;
+        
+        if (has_active_requests) {
+          // Requests exist but none are processable (all in cooldown)
+          consecutive_empty_processing_cycles += 1;
+          log_info(Principal.fromText("2vxsx-fae"), correlation_id, "No processable requests (all in cooldown?), empty cycle count: " # debug_show(consecutive_empty_processing_cycles));
+          
+          if (consecutive_empty_processing_cycles >= max_consecutive_empty_cycles) {
+            // Circuit breaker: pause to prevent infinite loop
+            log_info(Principal.fromText("2vxsx-fae"), correlation_id, "Max consecutive empty cycles reached, pausing queue");
+            claim_queue_processing_state := #Paused("All requests in cooldown, max empty cycles exceeded");
+            claim_processing_timer_id := null;
+            next_scheduled_timer_time := null;
+            claim_requests_processed_in_batch := 0;
+            consecutive_empty_processing_cycles := 0;
+            return;
+          };
+          
+          // Schedule next check after cooldown period
+          let timer_id = Timer.setTimer<system>(#nanoseconds(Nat64.toNat(claim_request_cooldown_ns)), process_claim_queue);
+          claim_processing_timer_id := ?timer_id;
+          next_scheduled_timer_time := ?(TimeAsNat64(Time.now()) + claim_request_cooldown_ns);
+          return;
+        } else {
+          // Queue is truly empty
+          log_info(Principal.fromText("2vxsx-fae"), correlation_id, "Claim queue is empty, stopping processor");
+          claim_processing_timer_id := null;
+          next_scheduled_timer_time := null;
+          claim_requests_processed_in_batch := 0;
+          consecutive_empty_processing_cycles := 0;
+          return;
+        };
       };
       case (?request) {
         // Check for timeout
@@ -1519,6 +1611,8 @@ shared (deployer) persistent actor class SneedLock() = this {
             created_at = request.created_at;
             started_processing_at = request.started_processing_at;
             completed_at = ?TimeAsNat64(Time.now());
+            retry_count = request.retry_count;
+            last_attempted_at = request.last_attempted_at;
           };
           archive_completed_request(updated_request);
           log_error(request.caller, correlation_id, "Request " # debug_show(request.request_id) # " timed out");
@@ -1532,6 +1626,9 @@ shared (deployer) persistent actor class SneedLock() = this {
 
         // Process the request
         await process_single_claim_request(request, correlation_id);
+
+        // Reset empty cycle counter (we successfully processed something)
+        consecutive_empty_processing_cycles := 0;
 
         // Increment batch counter
         claim_requests_processed_in_batch += 1;
@@ -1565,13 +1662,28 @@ shared (deployer) persistent actor class SneedLock() = this {
 
   // Process a single claim request
   private func process_single_claim_request(request : ClaimRequest, correlation_id : Nat) : async () {
-    log_info(request.caller, correlation_id, "Processing claim request " # debug_show(request.request_id));
+    log_info(request.caller, correlation_id, "Processing claim request " # debug_show(request.request_id) # ", retry_count=" # debug_show(request.retry_count));
 
-    // Update status to Processing and record start time
+    // Check if max retries exceeded
+    if (request.retry_count >= max_claim_retry_attempts) {
+      let error_msg = "Max retry attempts (" # debug_show(max_claim_retry_attempts) # ") exceeded";
+      log_error(request.caller, correlation_id, error_msg);
+      let failed_request = {
+        request with
+        status = #Failed(error_msg);
+        completed_at = ?TimeAsNat64(Time.now());
+      };
+      archive_failed_request(failed_request);
+      return;
+    };
+
+    // Update status to Processing, increment retry count, and record attempt time
     let updated_request_processing = {
       request with
       status = #Processing;
       started_processing_at = ?TimeAsNat64(Time.now());
+      retry_count = request.retry_count + 1;
+      last_attempted_at = ?TimeAsNat64(Time.now());
     };
     update_claim_request(updated_request_processing);
 
@@ -1601,8 +1713,8 @@ shared (deployer) persistent actor class SneedLock() = this {
       case (#err(err)) {
         let error_msg = "Failed to get position info: " # debug_show(err);
         log_error(request.caller, correlation_id, error_msg);
-        let failed_request = { request with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-        update_claim_request(failed_request);  // Keep in active array for retry
+        let failed_request = { updated_request_processing with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+        archive_failed_request(failed_request);  // Pre-claim failure, no funds stuck
         return;
       };
     };
@@ -1614,8 +1726,8 @@ shared (deployer) persistent actor class SneedLock() = this {
     if (not token0_has_enough and not token1_has_enough) {
       let error_msg = "Insufficient rewards to claim. Token0: " # debug_show(tokens_owed0) # " (need >= " # debug_show(2 * token0_fee) # "), Token1: " # debug_show(tokens_owed1) # " (need >= " # debug_show(2 * token1_fee) # ")";
       log_error(request.caller, correlation_id, error_msg);
-      let failed_request = { request with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-      update_claim_request(failed_request);  // Keep in active array for retry
+      let failed_request = { updated_request_processing with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+      archive_failed_request(failed_request);  // Pre-claim failure, no funds stuck
       return;
     };
 
@@ -1628,8 +1740,8 @@ shared (deployer) persistent actor class SneedLock() = this {
       case (#err(err)) {
         let error_msg = "Failed to get balance before claim: " # debug_show(err);
         log_error(request.caller, correlation_id, error_msg);
-        let failed_request = { request with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-        update_claim_request(failed_request);  // Keep in active array for retry
+        let failed_request = { updated_request_processing with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+        archive_failed_request(failed_request);  // Pre-claim failure, no funds stuck
         return;
       };
     };
@@ -1639,8 +1751,8 @@ shared (deployer) persistent actor class SneedLock() = this {
       if (balance0_before != 0 or balance1_before != 0) {
         let error_msg = "Safety check failed: Backend balance is not zero before claim. Token0: " # debug_show(balance0_before) # ", Token1: " # debug_show(balance1_before) # ". This indicates incomplete withdrawal from a previous claim.";
         log_error(request.caller, correlation_id, error_msg);
-        let failed_request = { request with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-        update_claim_request(failed_request);  // Keep in active array for retry
+        let failed_request = { updated_request_processing with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+        archive_failed_request(failed_request);  // Pre-claim failure, no funds stuck
         
         // Pause processing to prevent further issues
         claim_queue_processing_state := #Paused("Non-zero balance detected before claim");
@@ -1690,7 +1802,7 @@ shared (deployer) persistent actor class SneedLock() = this {
               let error_msg = "Claim failed and balance unchanged: " # debug_show(err);
               log_error(request.caller, correlation_id, error_msg);
               let failed_request = { updated_request_claim_attempted with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-              update_claim_request(failed_request);  // Keep in active array for retry
+              archive_failed_request(failed_request);  // Claim failed, verified no funds stuck
               return;
             } else {
               // Balance changed, claim succeeded despite error
@@ -1859,6 +1971,41 @@ shared (deployer) persistent actor class SneedLock() = this {
     result;
   };
 
+  // Query: Get all failed claim requests (from circular buffer, as Text)
+  public query func get_all_failed_claim_requests() : async [Text] {
+    var result : [Text] = [];
+    
+    // Get ID range
+    switch (CircularBuffer.CircularBufferLogic.get_id_range(failed_claim_requests_buffer)) {
+      case (?(start_id, end_id)) {
+        // Fetch all entries
+        let entries = CircularBuffer.CircularBufferLogic.get_entries_by_id(
+          failed_claim_requests_buffer,
+          start_id,
+          end_id - start_id + 1
+        );
+        
+        // Extract claim request text from entries
+        let requests = Array.mapFilter<?BufferEntry, Text>(
+          entries,
+          func(entry_opt) {
+            switch (entry_opt) {
+              case (?entry) { ?entry.content };
+              case null { null };
+            };
+          }
+        );
+        result := requests;
+      };
+      case null {
+        // Buffer is empty
+        result := [];
+      };
+    };
+    
+    result;
+  };
+
   // Query: Get active claim request by ID (pending/processing)
   public query func get_active_claim_request(request_id : ClaimRequestId) : async ?ClaimRequest {
     Array.find<ClaimRequest>(stable_claim_requests, func (req) { req.request_id == request_id });
@@ -1868,17 +2015,17 @@ shared (deployer) persistent actor class SneedLock() = this {
   public query func get_claim_request_status(request_id : ClaimRequestId) : async ?{
     #Active : ClaimRequest;
     #Completed : Text; // The full request as debug text
+    #Failed : Text; // Failed requests (pre-claim failures)
   } {
     // First check active requests
     switch (Array.find<ClaimRequest>(stable_claim_requests, func (req) { req.request_id == request_id })) {
       case (?active_req) { return ?#Active(active_req); };
       case null {
         // Search completed requests in circular buffer
-        let buffer_entries = Array.freeze(CircularBuffer.CircularBufferLogic.to_array(completed_claim_requests_buffer));
-        for (entry_opt in buffer_entries.vals()) {
+        let completed_entries = Array.freeze(CircularBuffer.CircularBufferLogic.to_array(completed_claim_requests_buffer));
+        for (entry_opt in completed_entries.vals()) {
           switch (entry_opt) {
             case (?entry) {
-              // The entry.id is the request_id we stored
               if (entry.id == request_id) {
                 return ?#Completed(entry.content);
               };
@@ -1886,6 +2033,20 @@ shared (deployer) persistent actor class SneedLock() = this {
             case null {};
           };
         };
+        
+        // Search failed requests in circular buffer
+        let failed_entries = Array.freeze(CircularBuffer.CircularBufferLogic.to_array(failed_claim_requests_buffer));
+        for (entry_opt in failed_entries.vals()) {
+          switch (entry_opt) {
+            case (?entry) {
+              if (entry.id == request_id) {
+                return ?#Failed(entry.content);
+              };
+            };
+            case null {};
+          };
+        };
+        
         return null;
       };
     };
@@ -1908,6 +2069,8 @@ shared (deployer) persistent actor class SneedLock() = this {
     processing_count : Nat;
     active_total : Nat;
     completed_buffer_count : Nat;
+    failed_buffer_count : Nat;
+    consecutive_empty_cycles : Nat;
   } {
     var pending = 0;
     var processing = 0;
@@ -1930,6 +2093,8 @@ shared (deployer) persistent actor class SneedLock() = this {
       processing_count = processing;
       active_total = stable_claim_requests.size();
       completed_buffer_count = completed_claim_requests_buffer.count;
+      failed_buffer_count = failed_claim_requests_buffer.count;
+      consecutive_empty_cycles = consecutive_empty_processing_cycles;
     };
   };
 
@@ -2106,7 +2271,7 @@ shared (deployer) persistent actor class SneedLock() = this {
           return #Err(msg);
         };
 
-        // Reset to pending
+        // Reset to pending (preserve retry_count and last_attempted_at for cooldown tracking)
         let updated_request : ClaimRequest = {
           request_id = request.request_id;
           caller = request.caller;
@@ -2118,6 +2283,8 @@ shared (deployer) persistent actor class SneedLock() = this {
           created_at = request.created_at;
           started_processing_at = null;
           completed_at = null;
+          retry_count = request.retry_count;  // Preserve retry count
+          last_attempted_at = request.last_attempted_at;  // Preserve for cooldown
         };
 
         // Update in array

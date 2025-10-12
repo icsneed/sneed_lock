@@ -263,6 +263,46 @@ Requests are processed **one at a time** because:
 3. Without sequential processing, we couldn't tell which rewards belong to which position
 4. Balance tracking before/after each claim ensures accurate attribution
 
+### Zero Balance Safety Check
+
+**Default: Enabled**
+
+Before processing each claim, the system checks if the backend's balance on the swap canister is zero:
+
+```
+✅ Balance = 0 → Safe to proceed (previous claims fully withdrawn)
+❌ Balance ≠ 0 → Fail and pause queue (incomplete withdrawal detected)
+```
+
+**Why this matters:**
+- If processing is truly sequential and all withdrawals succeed
+- Then the balance should always be 0 before the next claim
+- Non-zero balance indicates something went wrong with a previous claim
+- Could mean partial withdrawal, failed withdrawal, or processing error
+
+**When check fails:**
+1. Request marked as `#Failed` with detailed error
+2. Queue automatically pauses
+3. Admin must investigate and resolve
+4. Admin can then resume queue
+
+**Admin controls:**
+```motoko
+// Disable check temporarily (e.g., during recovery)
+await admin_set_enforce_zero_balance_before_claim(false);
+
+// Re-enable check
+await admin_set_enforce_zero_balance_before_claim(true);
+
+// Query current status
+let enabled = await get_enforce_zero_balance_before_claim();
+```
+
+**When to disable:**
+- During recovery operations
+- When manually resolving stuck funds
+- Temporary workarounds (re-enable ASAP)
+
 ## Error Handling
 
 ### Common Errors
@@ -278,6 +318,12 @@ Requests are processed **one at a time** because:
 **"Insufficient rewards to claim"**
 - Both tokens have < 2x their fee in rewards
 - Wait for more trading fees to accumulate
+
+**"Safety check failed: Backend balance is not zero before claim"**
+- Previous claim's withdrawal incomplete
+- Queue automatically pauses to prevent commingling
+- Admin must investigate, resolve stuck funds, then resume
+- If check is incorrect, admin can temporarily disable it
 
 **"Failed to get position info"**
 - ICPSwap query failed
@@ -326,6 +372,21 @@ public shared ({ caller }) func admin_remove_active_claim_request(request_id : N
 ```
 
 Removes a pending/processing request from the queue.
+
+### Set Zero Balance Enforcement
+
+```motoko
+public shared ({ caller }) func admin_set_enforce_zero_balance_before_claim(enforce : Bool) : async ()
+```
+
+Enable or disable the zero balance safety check. Default is `true` (enabled).
+
+**Use cases:**
+- Disable temporarily during recovery operations
+- Disable if stuck funds need manual resolution
+- Re-enable after issue is resolved
+
+**Important:** Always re-enable after resolving issues to maintain safety.
 
 ## Best Practices
 

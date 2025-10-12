@@ -98,6 +98,7 @@ shared (deployer) persistent actor class SneedLock() = this {
   stable var claim_queue_processing_state : QueueProcessingState = #Active;
   stable var claim_processing_timer_id : ?Nat = null;
   stable var claim_requests_processed_in_batch : Nat = 0;
+  stable var enforce_zero_balance_before_claim : Bool = true; // Safety check: balance must be 0 before claiming
 
   transient let admin = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
   transient let sneed_governance = Principal.fromText("fi3zi-fyaaa-aaaaq-aachq-cai");
@@ -1616,6 +1617,23 @@ shared (deployer) persistent actor class SneedLock() = this {
       };
     };
 
+    // Safety check: Balance should be zero if enforced (indicates previous claims were fully withdrawn)
+    if (enforce_zero_balance_before_claim) {
+      if (balance0_before != 0 or balance1_before != 0) {
+        let error_msg = "Safety check failed: Backend balance is not zero before claim. Token0: " # debug_show(balance0_before) # ", Token1: " # debug_show(balance1_before) # ". This indicates incomplete withdrawal from a previous claim.";
+        log_error(request.caller, correlation_id, error_msg);
+        let failed_request = { request with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+        archive_completed_request(failed_request);
+        
+        // Pause processing to prevent further issues
+        claim_queue_processing_state := #Paused("Non-zero balance detected before claim");
+        return;
+      };
+      log_info(request.caller, correlation_id, "Safety check passed: Balance is zero before claim");
+    } else {
+      log_info(request.caller, correlation_id, "Safety check disabled: Balance before claim - Token0: " # debug_show(balance0_before) # ", Token1: " # debug_show(balance1_before));
+    };
+
     let updated_request_balance_recorded = {
       updated_request_processing with
       status = #BalanceRecorded({ balance0_before = balance0_before; balance1_before = balance1_before });
@@ -1896,6 +1914,23 @@ shared (deployer) persistent actor class SneedLock() = this {
     };
     
     removed;
+  };
+
+  // Admin: Set zero balance enforcement flag
+  public shared ({ caller }) func admin_set_enforce_zero_balance_before_claim(enforce : Bool) : async () {
+    if (caller != sneed_governance and caller != admin) {
+      Debug.trap("Only admin can set zero balance enforcement");
+    };
+
+    let correlation_id = get_next_correlation_id();
+    log_info(caller, correlation_id, "Setting enforce_zero_balance_before_claim from " # debug_show(enforce_zero_balance_before_claim) # " to " # debug_show(enforce));
+    
+    enforce_zero_balance_before_claim := enforce;
+  };
+
+  // Query: Get zero balance enforcement status
+  public query func get_enforce_zero_balance_before_claim() : async Bool {
+    enforce_zero_balance_before_claim;
   };
 
   ////////////////

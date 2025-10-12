@@ -171,5 +171,45 @@ module {
         #Ok;
         #Err : TransferTokenLockOwnershipError;
     };
+
+    // Claim and Withdraw Queue Types
+    public type ClaimRequestId = Nat;
+
+    public type ClaimRequestStatus = {
+        #Pending;
+        #Processing;
+        #BalanceRecorded : { balance0_before: Balance; balance1_before: Balance };
+        #ClaimAttempted : { balance0_before: Balance; balance1_before: Balance; claim_attempt: Nat };
+        #ClaimVerified : { balance0_before: Balance; balance1_before: Balance; amount0_claimed: Balance; amount1_claimed: Balance };
+        #Withdrawn : { amount0_claimed: Balance; amount1_claimed: Balance };
+        #Completed;
+        #Failed : Text;
+        #TimedOut;
+    };
+
+    public type ClaimRequest = {
+        request_id: ClaimRequestId;
+        caller: Principal;
+        swap_canister_id: SwapCanisterId;
+        position_id: PositionId;
+        token0: TokenType;
+        token1: TokenType;
+        status: ClaimRequestStatus;
+        created_at: Timestamp;
+        started_processing_at: ?Timestamp;
+        completed_at: ?Timestamp;
+    };
+
+    public type ClaimAndWithdrawResult = {
+        #Ok : ClaimRequestId;
+        #Err : Text;
+    };
+
+    public type QueueProcessingState = {
+        #Active;
+        #Paused : Text; // reason for pause
+    };
+
+    public type StableClaimRequests = [ClaimRequest];
     // TODO: this can give us guid/uuid??: https://github.com/aviate-labs/uuid.mo
 };

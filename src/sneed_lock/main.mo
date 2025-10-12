@@ -11,6 +11,7 @@ import Nat8 "mo:base/Nat8";
 import Blob "mo:base/Blob";
 import Bool "mo:base/Bool";
 import Debug "mo:base/Debug";
+import Timer "mo:base/Timer";
 
 import T "Types";
 
@@ -18,7 +19,7 @@ import CircularBuffer "CircularBuffer";
 
 // TODO: figure out when new instances of actors are created, whether or not that depends on the client at all, and how this effects the persistent state of the actor.
 //       https://internetcomputer.org/docs/current/motoko/main/writing-motoko/actor-classes
-shared (deployer) actor class SneedLock() = this {
+shared (deployer) persistent actor class SneedLock() = this {
 
   ////////////////
   // locks
@@ -58,15 +59,25 @@ shared (deployer) actor class SneedLock() = this {
   type TransferPositionOwnershipError = T.TransferPositionOwnershipError;
   type TransferTokenLockOwnershipResult = T.TransferTokenLockOwnershipResult;
   type TransferTokenLockOwnershipError = T.TransferTokenLockOwnershipError;
+  type ClaimRequestId = T.ClaimRequestId;
+  type ClaimRequestStatus = T.ClaimRequestStatus;
+  type ClaimRequest = T.ClaimRequest;
+  type ClaimAndWithdrawResult = T.ClaimAndWithdrawResult;
+  type QueueProcessingState = T.QueueProcessingState;
+  type StableClaimRequests = T.StableClaimRequests;
 
   // consts
-  let transaction_fee_sneed_e8s : Nat = 1000;
-  let second_ns : Nat64 = 1_000_000_000; // 1 second in nanoseconds
-  let minute_ns : Nat64 = 60 * second_ns; // 1 minute in nanoseconds
-  let hour_ns : Nat64 = 60 * minute_ns; // 1 hour in nanoseconds
-  let day_ns : Nat64 = 24 * hour_ns; // 1 day in nanoseconds
+  transient let transaction_fee_sneed_e8s : Nat = 1000;
+  transient let second_ns : Nat64 = 1_000_000_000; // 1 second in nanoseconds
+  transient let minute_ns : Nat64 = 60 * second_ns; // 1 minute in nanoseconds
+  transient let hour_ns : Nat64 = 60 * minute_ns; // 1 hour in nanoseconds
+  transient let day_ns : Nat64 = 24 * hour_ns; // 1 day in nanoseconds
   // dex consts
-  let dex_icpswap : T.Dex = 1;
+  transient let dex_icpswap : T.Dex = 1;
+  // claim queue consts
+  transient let max_requests_per_batch : Nat = 10;
+  transient let claim_request_timeout_ns : Nat64 = 30 * minute_ns; // 30 minutes
+  transient let batch_pause_duration_ns : Nat64 = 10 * minute_ns; // 10 minutes
 
   // stable memory
   stable var stableLocks : StableLocks = [];
@@ -79,15 +90,22 @@ shared (deployer) actor class SneedLock() = this {
   stable var error_log : CircularBuffer = CircularBuffer.CircularBufferLogic.create(10_000);
   stable var info_log : CircularBuffer = CircularBuffer.CircularBufferLogic.create(10_000);
   stable var next_correlation_id : Nat = 0;
+  
+  // Claim queue stable state
+  stable var stable_claim_requests : StableClaimRequests = [];
+  stable var next_claim_request_id : Nat = 0;
+  stable var claim_queue_processing_state : QueueProcessingState = #Active;
+  stable var claim_processing_timer_id : ?Nat = null;
+  stable var claim_requests_processed_in_batch : Nat = 0;
 
-  let admin = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
-  let sneed_governance = Principal.fromText("fi3zi-fyaaa-aaaaq-aachq-cai");
+  transient let admin = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
+  transient let sneed_governance = Principal.fromText("fi3zi-fyaaa-aaaaq-aachq-cai");
 
-  let icrc1_sneed_ledger_canister_id = Principal.fromText("hvgxa-wqaaa-aaaaq-aacia-cai");
-  let sneed_defi_canister_id = Principal.fromText("ok64y-uiaaa-aaaag-qdcbq-cai");
+  transient let icrc1_sneed_ledger_canister_id = Principal.fromText("hvgxa-wqaaa-aaaaq-aacia-cai");
+  transient let sneed_defi_canister_id = Principal.fromText("ok64y-uiaaa-aaaag-qdcbq-cai");
 
   // ephemeral state
-  let state : State = object { 
+  transient let state : State = object { 
     // initialize as empty here, see postupgrade for how to populate from stable memory
     public let principal_token_locks: PrincipalTokenLockMap = HashMap.HashMap<Principal, TokenLockMap>(100, Principal.equal, Principal.hash);
     public let principal_position_locks : HashMap.HashMap<Principal, T.PositionLockMap> = HashMap.HashMap<Principal, T.PositionLockMap>(100, Principal.equal, Principal.hash);
@@ -1321,6 +1339,490 @@ shared (deployer) actor class SneedLock() = this {
     };
 
     max_lock_length_ns := new_max_lock_length_days * day_ns;
+  };
+
+  ////////////////
+  // Claim and Withdraw Queue
+  ////////////////
+
+  // Helper: Get oldest pending request
+  private func get_oldest_pending_request() : ?ClaimRequest {
+    for (request in stable_claim_requests.vals()) {
+      switch (request.status) {
+        case (#Pending) { return ?request; };
+        case (#Processing) { return ?request; };
+        case (#BalanceRecorded(_)) { return ?request; };
+        case (#ClaimAttempted(_)) { return ?request; };
+        case (#ClaimVerified(_)) { return ?request; };
+        case _ {}; // Skip completed, failed, or timed out
+      };
+    };
+    null;
+  };
+
+  // Helper: Update request in stable array
+  private func update_claim_request(updated_request : ClaimRequest) : () {
+    stable_claim_requests := Array.map<ClaimRequest, ClaimRequest>(
+      stable_claim_requests,
+      func (req) {
+        if (req.request_id == updated_request.request_id) {
+          updated_request
+        } else {
+          req
+        }
+      }
+    );
+  };
+
+  // Helper: Check if request has timed out
+  private func has_request_timed_out(request : ClaimRequest) : Bool {
+    switch (request.started_processing_at) {
+      case (?started_at) {
+        let now = TimeAsNat64(Time.now());
+        (now - started_at) > claim_request_timeout_ns
+      };
+      case null { false };
+    };
+  };
+
+  // Public: Request claim and withdraw
+  public shared ({ caller }) func request_claim_and_withdraw(
+    swap_canister_id : T.SwapCanisterId,
+    position_id : T.PositionId
+  ) : async ClaimAndWithdrawResult {
+    let correlation_id = get_next_correlation_id();
+    log_info(caller, correlation_id, "Requesting claim and withdraw for position " # debug_show(position_id) # " on swap canister " # debug_show(swap_canister_id));
+
+    // Verify caller owns the position
+    if (not has_claimed_position_impl(caller, swap_canister_id, position_id)) {
+      let error = "Caller does not own position " # debug_show(position_id) # " on swap canister " # debug_show(swap_canister_id);
+      log_error(caller, correlation_id, error);
+      return #Err(error);
+    };
+
+    // Get position lock to verify it's locked and get token info
+    let position_lock = get_position_lock(caller, swap_canister_id, position_id);
+    let (token0, token1) = switch (position_lock) {
+      case (?lock) { (lock.token0, lock.token1) };
+      case null {
+        let error = "Position " # debug_show(position_id) # " is not locked";
+        log_error(caller, correlation_id, error);
+        return #Err(error);
+      };
+    };
+
+    // Create the request
+    next_claim_request_id += 1;
+    let request : ClaimRequest = {
+      request_id = next_claim_request_id;
+      caller = caller;
+      swap_canister_id = swap_canister_id;
+      position_id = position_id;
+      token0 = token0;
+      token1 = token1;
+      status = #Pending;
+      created_at = TimeAsNat64(Time.now());
+      started_processing_at = null;
+      completed_at = null;
+    };
+
+    // Add to queue
+    stable_claim_requests := Array.append(stable_claim_requests, [request]);
+    log_info(caller, correlation_id, "Created claim request " # debug_show(request.request_id) # " for position " # debug_show(position_id));
+
+    // Start processing if not already running
+    ignore start_claim_queue_processor();
+
+    #Ok(request.request_id);
+  };
+
+  // Start the claim queue processor timer
+  private func start_claim_queue_processor() : async () {
+    switch (claim_processing_timer_id) {
+      case (?_) {
+        // Already running
+      };
+      case null {
+        // Start with 0 second delay
+        let timer_id = Timer.setTimer<system>(#seconds(0), process_claim_queue);
+        claim_processing_timer_id := ?timer_id;
+      };
+    };
+  };
+
+  // Main queue processor function
+  private func process_claim_queue() : async () {
+    let correlation_id = get_next_correlation_id();
+    
+    // Check if processing is paused
+    switch (claim_queue_processing_state) {
+      case (#Paused(reason)) {
+        log_info(Principal.fromText("2vxsx-fae"), correlation_id, "Claim queue processing is paused: " # reason);
+        claim_processing_timer_id := null;
+        return;
+      };
+      case (#Active) {};
+    };
+
+    // Get oldest pending request
+    switch (get_oldest_pending_request()) {
+      case null {
+        // Queue is empty
+        log_info(Principal.fromText("2vxsx-fae"), correlation_id, "Claim queue is empty, stopping processor");
+        claim_processing_timer_id := null;
+        claim_requests_processed_in_batch := 0;
+        return;
+      };
+      case (?request) {
+        // Check for timeout
+        if (has_request_timed_out(request)) {
+          let updated_request = {
+            request_id = request.request_id;
+            caller = request.caller;
+            swap_canister_id = request.swap_canister_id;
+            position_id = request.position_id;
+            token0 = request.token0;
+            token1 = request.token1;
+            status = #TimedOut;
+            created_at = request.created_at;
+            started_processing_at = request.started_processing_at;
+            completed_at = ?TimeAsNat64(Time.now());
+          };
+          update_claim_request(updated_request);
+          log_error(request.caller, correlation_id, "Request " # debug_show(request.request_id) # " timed out");
+          
+          // Pause processing
+          claim_queue_processing_state := #Paused("Request " # debug_show(request.request_id) # " timed out");
+          claim_processing_timer_id := null;
+          return;
+        };
+
+        // Process the request
+        await process_single_claim_request(request, correlation_id);
+
+        // Increment batch counter
+        claim_requests_processed_in_batch += 1;
+
+        // Check if we need to pause
+        if (claim_requests_processed_in_batch >= max_requests_per_batch) {
+          switch (get_oldest_pending_request()) {
+            case null {
+              // Queue is now empty, reset counter
+              claim_requests_processed_in_batch := 0;
+            };
+            case (?_) {
+              // More requests pending, schedule pause
+              log_info(Principal.fromText("2vxsx-fae"), correlation_id, "Processed " # debug_show(max_requests_per_batch) # " requests, pausing for 10 minutes");
+              claim_requests_processed_in_batch := 0;
+              let timer_id = Timer.setTimer<system>(#nanoseconds(Nat64.toNat(batch_pause_duration_ns)), process_claim_queue);
+              claim_processing_timer_id := ?timer_id;
+              return;
+            };
+          };
+        };
+
+        // Schedule next iteration immediately
+        let timer_id = Timer.setTimer<system>(#seconds(0), process_claim_queue);
+        claim_processing_timer_id := ?timer_id;
+      };
+    };
+  };
+
+  // Process a single claim request
+  private func process_single_claim_request(request : ClaimRequest, correlation_id : Nat) : async () {
+    log_info(request.caller, correlation_id, "Processing claim request " # debug_show(request.request_id));
+
+    // Update status to Processing and record start time
+    let updated_request_processing = {
+      request with
+      status = #Processing;
+      started_processing_at = ?TimeAsNat64(Time.now());
+    };
+    update_claim_request(updated_request_processing);
+
+    // Get ICPSwap swap canister actor
+    let swap_canister = actor (Principal.toText(request.swap_canister_id)) : actor {
+      claim : (args : { positionId : Nat }) -> async { #ok : { amount0 : Nat; amount1 : Nat }; #err : T.SwapCanisterError };
+      getUserUnusedBalance : (principal : Principal) -> async { #ok : { balance0 : Nat; balance1 : Nat }; #err : T.SwapCanisterError };
+      withdrawToSubaccount : (args : {
+        amount : Nat;
+        fee : Nat;
+        subaccount : Blob;
+        token : Text;
+      }) -> async { #ok : Nat; #err : T.SwapCanisterError };
+    };
+
+    // Step 1: Record balance before claim
+    let balance_result = await swap_canister.getUserUnusedBalance(this_canister_id());
+    let (balance0_before, balance1_before) = switch (balance_result) {
+      case (#ok(balances)) { (balances.balance0, balances.balance1) };
+      case (#err(err)) {
+        let error_msg = "Failed to get balance before claim: " # debug_show(err);
+        log_error(request.caller, correlation_id, error_msg);
+        let failed_request = { request with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+        update_claim_request(failed_request);
+        return;
+      };
+    };
+
+    let updated_request_balance_recorded = {
+      updated_request_processing with
+      status = #BalanceRecorded({ balance0_before = balance0_before; balance1_before = balance1_before });
+    };
+    update_claim_request(updated_request_balance_recorded);
+    log_info(request.caller, correlation_id, "Recorded balance before claim: token0=" # debug_show(balance0_before) # ", token1=" # debug_show(balance1_before));
+
+    // Step 2: Attempt claim
+    let claim_result = await swap_canister.claim({ positionId = request.position_id });
+    
+    let updated_request_claim_attempted = {
+      updated_request_balance_recorded with
+      status = #ClaimAttempted({ balance0_before = balance0_before; balance1_before = balance1_before; claim_attempt = 1 });
+    };
+    update_claim_request(updated_request_claim_attempted);
+
+    let (amount0_claimed, amount1_claimed) = switch (claim_result) {
+      case (#ok(amounts)) {
+        log_info(request.caller, correlation_id, "Claim succeeded: amount0=" # debug_show(amounts.amount0) # ", amount1=" # debug_show(amounts.amount1));
+        (amounts.amount0, amounts.amount1)
+      };
+      case (#err(err)) {
+        // Claim failed, check if balance changed
+        log_info(request.caller, correlation_id, "Claim returned error: " # debug_show(err) # ", checking balance");
+        let balance_after_result = await swap_canister.getUserUnusedBalance(this_canister_id());
+        switch (balance_after_result) {
+          case (#ok(balances_after)) {
+            let balance_change0 = if (balances_after.balance0 >= balance0_before) {
+              balances_after.balance0 - balance0_before
+            } else { 0 };
+            let balance_change1 = if (balances_after.balance1 >= balance1_before) {
+              balances_after.balance1 - balance1_before
+            } else { 0 };
+
+            if (balance_change0 == 0 and balance_change1 == 0) {
+              // Balance didn't change, claim truly failed
+              let error_msg = "Claim failed and balance unchanged: " # debug_show(err);
+              log_error(request.caller, correlation_id, error_msg);
+              let failed_request = { updated_request_claim_attempted with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+              update_claim_request(failed_request);
+              return;
+            } else {
+              // Balance changed, claim succeeded despite error
+              log_info(request.caller, correlation_id, "Claim succeeded (balance changed): amount0=" # debug_show(balance_change0) # ", amount1=" # debug_show(balance_change1));
+              (balance_change0, balance_change1)
+            };
+          };
+          case (#err(balance_err)) {
+            let error_msg = "Failed to verify balance after claim error: " # debug_show(balance_err);
+            log_error(request.caller, correlation_id, error_msg);
+            let failed_request = { updated_request_claim_attempted with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+            update_claim_request(failed_request);
+            return;
+          };
+        };
+      };
+    };
+
+    let updated_request_verified = {
+      updated_request_claim_attempted with
+      status = #ClaimVerified({
+        balance0_before = balance0_before;
+        balance1_before = balance1_before;
+        amount0_claimed = amount0_claimed;
+        amount1_claimed = amount1_claimed;
+      });
+    };
+    update_claim_request(updated_request_verified);
+
+    // Step 3: Withdraw to caller's subaccount
+    let caller_subaccount = PrincipalToSubaccount(request.caller);
+    
+    // Get token fees
+    let token0_ledger = actor (Principal.toText(request.token0)) : actor { icrc1_fee : () -> async Nat };
+    let token1_ledger = actor (Principal.toText(request.token1)) : actor { icrc1_fee : () -> async Nat };
+    let token0_fee = await token0_ledger.icrc1_fee();
+    let token1_fee = await token1_ledger.icrc1_fee();
+
+    // Withdraw token0 if amount > 0
+    if (amount0_claimed > 0) {
+      let withdraw0_result = await swap_canister.withdrawToSubaccount({
+        amount = amount0_claimed;
+        fee = token0_fee;
+        subaccount = Blob.fromArray(caller_subaccount);
+        token = Principal.toText(request.token0);
+      });
+      switch (withdraw0_result) {
+        case (#ok(_)) {
+          log_info(request.caller, correlation_id, "Withdrew token0: " # debug_show(amount0_claimed));
+        };
+        case (#err(err)) {
+          let error_msg = "Failed to withdraw token0: " # debug_show(err);
+          log_error(request.caller, correlation_id, error_msg);
+          let failed_request = { updated_request_verified with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+          update_claim_request(failed_request);
+          return;
+        };
+      };
+    };
+
+    // Withdraw token1 if amount > 0
+    if (amount1_claimed > 0) {
+      let withdraw1_result = await swap_canister.withdrawToSubaccount({
+        amount = amount1_claimed;
+        fee = token1_fee;
+        subaccount = Blob.fromArray(caller_subaccount);
+        token = Principal.toText(request.token1);
+      });
+      switch (withdraw1_result) {
+        case (#ok(_)) {
+          log_info(request.caller, correlation_id, "Withdrew token1: " # debug_show(amount1_claimed));
+        };
+        case (#err(err)) {
+          let error_msg = "Failed to withdraw token1: " # debug_show(err);
+          log_error(request.caller, correlation_id, error_msg);
+          let failed_request = { updated_request_verified with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+          update_claim_request(failed_request);
+          return;
+        };
+      };
+    };
+
+    // Mark as completed
+    let completed_request = {
+      updated_request_verified with
+      status = #Completed;
+      completed_at = ?TimeAsNat64(Time.now());
+    };
+    update_claim_request(completed_request);
+    log_info(request.caller, correlation_id, "Completed claim request " # debug_show(request.request_id));
+  };
+
+  // Query: Get all claim requests for caller
+  public query ({ caller }) func get_my_claim_requests() : async [ClaimRequest] {
+    Array.filter<ClaimRequest>(stable_claim_requests, func (req) { req.caller == caller });
+  };
+
+  // Query: Get claim request by ID
+  public query func get_claim_request(request_id : ClaimRequestId) : async ?ClaimRequest {
+    Array.find<ClaimRequest>(stable_claim_requests, func (req) { req.request_id == request_id });
+  };
+
+  // Query: Get queue status
+  public query func get_claim_queue_status() : async {
+    processing_state : QueueProcessingState;
+    pending_count : Nat;
+    processing_count : Nat;
+    completed_count : Nat;
+    failed_count : Nat;
+    total_count : Nat;
+  } {
+    var pending = 0;
+    var processing = 0;
+    var completed = 0;
+    var failed = 0;
+
+    for (req in stable_claim_requests.vals()) {
+      switch (req.status) {
+        case (#Pending) { pending += 1; };
+        case (#Processing) { processing += 1; };
+        case (#BalanceRecorded(_)) { processing += 1; };
+        case (#ClaimAttempted(_)) { processing += 1; };
+        case (#ClaimVerified(_)) { processing += 1; };
+        case (#Withdrawn(_)) { processing += 1; };
+        case (#Completed) { completed += 1; };
+        case (#Failed(_)) { failed += 1; };
+        case (#TimedOut) { failed += 1; };
+      };
+    };
+
+    {
+      processing_state = claim_queue_processing_state;
+      pending_count = pending;
+      processing_count = processing;
+      completed_count = completed;
+      failed_count = failed;
+      total_count = stable_claim_requests.size();
+    };
+  };
+
+  // Admin: Resume queue processing
+  public shared ({ caller }) func admin_resume_claim_queue() : async () {
+    if (caller != sneed_governance and caller != admin) {
+      Debug.trap("Only admin can resume claim queue processing");
+    };
+
+    let correlation_id = get_next_correlation_id();
+    log_info(caller, correlation_id, "Resuming claim queue processing");
+    
+    claim_queue_processing_state := #Active;
+    claim_requests_processed_in_batch := 0;
+    ignore start_claim_queue_processor();
+  };
+
+  // Admin: Pause queue processing
+  public shared ({ caller }) func admin_pause_claim_queue(reason : Text) : async () {
+    if (caller != sneed_governance and caller != admin) {
+      Debug.trap("Only admin can pause claim queue processing");
+    };
+
+    let correlation_id = get_next_correlation_id();
+    log_info(caller, correlation_id, "Pausing claim queue processing: " # reason);
+    
+    claim_queue_processing_state := #Paused(reason);
+    
+    // Cancel existing timer
+    switch (claim_processing_timer_id) {
+      case (?timer_id) {
+        Timer.cancelTimer(timer_id);
+        claim_processing_timer_id := null;
+      };
+      case null {};
+    };
+  };
+
+  // Admin: Clear completed/failed requests
+  public shared ({ caller }) func admin_clear_completed_claim_requests() : async Nat {
+    if (caller != sneed_governance and caller != admin) {
+      Debug.trap("Only admin can clear completed requests");
+    };
+
+    let before_count = stable_claim_requests.size();
+    stable_claim_requests := Array.filter<ClaimRequest>(stable_claim_requests, func (req) {
+      switch (req.status) {
+        case (#Completed) { false };
+        case (#Failed(_)) { false };
+        case (#TimedOut) { false };
+        case _ { true };
+      };
+    });
+    let after_count = stable_claim_requests.size();
+    let cleared = before_count - after_count;
+
+    let correlation_id = get_next_correlation_id();
+    log_info(caller, correlation_id, "Cleared " # debug_show(cleared) # " completed/failed claim requests");
+    
+    cleared;
+  };
+
+  // Admin: Remove specific request
+  public shared ({ caller }) func admin_remove_claim_request(request_id : ClaimRequestId) : async Bool {
+    if (caller != sneed_governance and caller != admin) {
+      Debug.trap("Only admin can remove claim requests");
+    };
+
+    let before_count = stable_claim_requests.size();
+    stable_claim_requests := Array.filter<ClaimRequest>(stable_claim_requests, func (req) {
+      req.request_id != request_id
+    });
+    let after_count = stable_claim_requests.size();
+
+    let removed = before_count != after_count;
+    if (removed) {
+      let correlation_id = get_next_correlation_id();
+      log_info(caller, correlation_id, "Removed claim request " # debug_show(request_id));
+    };
+    
+    removed;
   };
 
   ////////////////

@@ -21,29 +21,6 @@ import CircularBuffer "CircularBuffer";
 //       https://internetcomputer.org/docs/current/motoko/main/writing-motoko/actor-classes
 
 // Migration expression to handle stable variable type changes
-(with migration = func (old : { var stable_claim_requests : [T.ClaimRequestV1] }) : { var stable_claim_requests : [T.ClaimRequest] } {
-  {
-    var stable_claim_requests = Array.map<T.ClaimRequestV1, T.ClaimRequest>(
-      old.stable_claim_requests,
-      func (oldReq : T.ClaimRequestV1) : T.ClaimRequest {
-        {
-          request_id = oldReq.request_id;
-          caller = oldReq.caller;
-          swap_canister_id = oldReq.swap_canister_id;
-          position_id = oldReq.position_id;
-          token0 = oldReq.token0;
-          token1 = oldReq.token1;
-          status = oldReq.status;
-          created_at = oldReq.created_at;
-          started_processing_at = oldReq.started_processing_at;
-          completed_at = oldReq.completed_at;
-          retry_count = 0;  // Initialize new field to 0
-          last_attempted_at = null;  // Initialize new field to null
-        }
-      }
-    );
-  }
-})
 
 shared (deployer) persistent actor class SneedLock() = this {
 
@@ -135,6 +112,9 @@ shared (deployer) persistent actor class SneedLock() = this {
  
   // shouldn't be stable but is for legacy reasons. 
   stable var claim_processing_timer_id : ?Nat = null;
+  
+  // Admin management
+  stable var admin_list : [Principal] = []; // List of additional admin principals
   
   // Ephemeral timer state (not stable - timer IDs don't persist across upgrades)
   transient var next_scheduled_timer_time : ?T.Timestamp = null;
@@ -1331,9 +1311,97 @@ shared (deployer) persistent actor class SneedLock() = this {
   ////////////////
   // admin
   ////////////////
+  
+  // Helper function to check if a principal has admin privileges
+  private func isAdmin(principal : Principal) : Bool {
+    // Check if principal is a controller
+    if (Principal.isController(principal)) {
+      return true;
+    };
+    
+    // Check if principal is the hardcoded admin
+    if (Principal.equal(principal, admin)) {
+      return true;
+    };
+    
+    // Check if principal is sneed_governance
+    if (Principal.equal(principal, sneed_governance)) {
+      return true;
+    };
+    
+    // Check if principal is in the admin list
+    for (admin_principal in admin_list.vals()) {
+      if (Principal.equal(principal, admin_principal)) {
+        return true;
+      };
+    };
+    
+    return false;
+  };
+  
+  // Admin: Add a principal to the admin list
+  public shared ({ caller }) func admin_add_admin(new_admin : Principal) : async {
+    #Ok : Text;
+    #Err : Text;
+  } {
+    if (not isAdmin(caller)) {
+      return #Err("Only admins can add new admins");
+    };
+    
+    // Check if already in the list
+    for (admin_principal in admin_list.vals()) {
+      if (Principal.equal(admin_principal, new_admin)) {
+        return #Err("Principal is already an admin");
+      };
+    };
+    
+    // Add to the list
+    admin_list := Array.append(admin_list, [new_admin]);
+    
+    let correlation_id = get_next_correlation_id();
+    log_info(caller, correlation_id, "Added new admin: " # debug_show(new_admin));
+    
+    #Ok("Admin added successfully");
+  };
+  
+  // Admin: Remove a principal from the admin list
+  public shared ({ caller }) func admin_remove_admin(admin_to_remove : Principal) : async {
+    #Ok : Text;
+    #Err : Text;
+  } {
+    if (not isAdmin(caller)) {
+      return #Err("Only admins can remove admins");
+    };
+    
+    // Check if the admin exists in the list
+    let found = Array.find<Principal>(admin_list, func (p) {
+      Principal.equal(p, admin_to_remove)
+    });
+    
+    if (found == null) {
+      return #Err("Principal is not in the admin list");
+    };
+    
+    // Remove from the list
+    let before_count = admin_list.size();
+    admin_list := Array.filter<Principal>(admin_list, func (p) {
+      not Principal.equal(p, admin_to_remove)
+    });
+    
+    let correlation_id = get_next_correlation_id();
+    log_info(caller, correlation_id, "Removed admin: " # debug_show(admin_to_remove));
+    
+    #Ok("Admin removed successfully");
+  };
+  
+  // Query: Get the list of additional admins
+  public query func get_admin_list() : async [Principal] {
+    admin_list;
+  };
+  
   //
   public shared ({ caller }) func admin_return_token(icrc1_ledger_canister_id: Principal, amount: Nat, user_principal : Principal) : async TransferResult {
-    if (caller != sneed_governance and caller != admin) {
+    if (not isAdmin(caller)) {
       Debug.trap("Only the SNEED governance or Admin can return tokens.");
     };
 
@@ -1361,7 +1429,7 @@ shared (deployer) persistent actor class SneedLock() = this {
 
 
   public shared ({ caller }) func set_token_lock_fee_sneed_e8s(new_token_lock_fee_sneed_e8s: Nat) : async SetLockFeeResult {    
-    if (caller != sneed_governance and caller != admin) {
+    if (not isAdmin(caller)) {
       return #Err("Only the SNEED governance can set the lock fee");
     };
 
@@ -1375,7 +1443,7 @@ shared (deployer) persistent actor class SneedLock() = this {
   };
 
   public shared ({ caller }) func set_max_lock_length_days(new_max_lock_length_days: Nat64) : async () {    
-    if (caller != sneed_governance and caller != admin) {
+    if (not isAdmin(caller)) {
       Debug.trap("Only the SNEED governance can set the max lock length.");
     };
 
@@ -2127,7 +2195,7 @@ shared (deployer) persistent actor class SneedLock() = this {
 
   // Admin: Resume queue processing
   public shared ({ caller }) func admin_resume_claim_queue() : async () {
-    if (caller != sneed_governance and caller != admin) {
+    if (not isAdmin(caller)) {
       Debug.trap("Only admin can resume claim queue processing");
     };
 
@@ -2141,7 +2209,7 @@ shared (deployer) persistent actor class SneedLock() = this {
 
   // Admin: Pause queue processing
   public shared ({ caller }) func admin_pause_claim_queue(reason : Text) : async () {
-    if (caller != sneed_governance and caller != admin) {
+    if (not isAdmin(caller)) {
       Debug.trap("Only admin can pause claim queue processing");
     };
 
@@ -2163,7 +2231,7 @@ shared (deployer) persistent actor class SneedLock() = this {
 
   // Admin: Emergency stop - immediately cancel timer
   public shared ({ caller }) func admin_emergency_stop_timer() : async () {
-    if (caller != sneed_governance and caller != admin) {
+    if (not isAdmin(caller)) {
       Debug.trap("Only admin can emergency stop timer");
     };
 
@@ -2191,7 +2259,7 @@ shared (deployer) persistent actor class SneedLock() = this {
 
   // Admin: Clear completed requests circular buffer
   public shared ({ caller }) func admin_clear_completed_claim_requests_buffer() : async Nat {
-    if (caller != sneed_governance and caller != admin) {
+    if (not isAdmin(caller)) {
       Debug.trap("Only admin can clear completed requests buffer");
     };
 
@@ -2206,7 +2274,7 @@ shared (deployer) persistent actor class SneedLock() = this {
 
   // Admin: Remove specific active request (pending/processing only)
   public shared ({ caller }) func admin_remove_active_claim_request(request_id : ClaimRequestId) : async Bool {
-    if (caller != sneed_governance and caller != admin) {
+    if (not isAdmin(caller)) {
       Debug.trap("Only admin can remove claim requests");
     };
 
@@ -2227,7 +2295,7 @@ shared (deployer) persistent actor class SneedLock() = this {
 
   // Admin: Manually trigger claim queue processing (immediate execution)
   public shared ({ caller }) func admin_trigger_claim_processing() : async Text {
-    if (caller != sneed_governance and caller != admin) {
+    if (not isAdmin(caller)) {
       Debug.trap("Only admin can manually trigger claim processing");
     };
 
@@ -2266,7 +2334,7 @@ shared (deployer) persistent actor class SneedLock() = this {
     #Ok : Text;
     #Err : Text;
   } {
-    if (caller != sneed_governance and caller != admin) {
+    if (not isAdmin(caller)) {
       Debug.trap("Only admin can retry claim requests");
     };
 
@@ -2381,7 +2449,7 @@ shared (deployer) persistent actor class SneedLock() = this {
     #Ok : Text;
     #Err : Text;
   } {
-    if (caller != sneed_governance and caller != admin) {
+    if (not isAdmin(caller)) {
       Debug.trap("Only admin can manually withdraw");
     };
 
@@ -2541,7 +2609,7 @@ shared (deployer) persistent actor class SneedLock() = this {
 
   // Admin: Set zero balance enforcement flag
   public shared ({ caller }) func admin_set_enforce_zero_balance_before_claim(enforce : Bool) : async () {
-    if (caller != sneed_governance and caller != admin) {
+    if (not isAdmin(caller)) {
       Debug.trap("Only admin can set zero balance enforcement");
     };
 

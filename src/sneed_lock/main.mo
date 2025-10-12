@@ -1602,7 +1602,7 @@ shared (deployer) persistent actor class SneedLock() = this {
         let error_msg = "Failed to get position info: " # debug_show(err);
         log_error(request.caller, correlation_id, error_msg);
         let failed_request = { request with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-        archive_completed_request(failed_request);
+        update_claim_request(failed_request);  // Keep in active array for retry
         return;
       };
     };
@@ -1615,7 +1615,7 @@ shared (deployer) persistent actor class SneedLock() = this {
       let error_msg = "Insufficient rewards to claim. Token0: " # debug_show(tokens_owed0) # " (need >= " # debug_show(2 * token0_fee) # "), Token1: " # debug_show(tokens_owed1) # " (need >= " # debug_show(2 * token1_fee) # ")";
       log_error(request.caller, correlation_id, error_msg);
       let failed_request = { request with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-      archive_completed_request(failed_request);
+      update_claim_request(failed_request);  // Keep in active array for retry
       return;
     };
 
@@ -1629,7 +1629,7 @@ shared (deployer) persistent actor class SneedLock() = this {
         let error_msg = "Failed to get balance before claim: " # debug_show(err);
         log_error(request.caller, correlation_id, error_msg);
         let failed_request = { request with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-        archive_completed_request(failed_request);
+        update_claim_request(failed_request);  // Keep in active array for retry
         return;
       };
     };
@@ -1640,7 +1640,7 @@ shared (deployer) persistent actor class SneedLock() = this {
         let error_msg = "Safety check failed: Backend balance is not zero before claim. Token0: " # debug_show(balance0_before) # ", Token1: " # debug_show(balance1_before) # ". This indicates incomplete withdrawal from a previous claim.";
         log_error(request.caller, correlation_id, error_msg);
         let failed_request = { request with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-        archive_completed_request(failed_request);
+        update_claim_request(failed_request);  // Keep in active array for retry
         
         // Pause processing to prevent further issues
         claim_queue_processing_state := #Paused("Non-zero balance detected before claim");
@@ -1690,7 +1690,7 @@ shared (deployer) persistent actor class SneedLock() = this {
               let error_msg = "Claim failed and balance unchanged: " # debug_show(err);
               log_error(request.caller, correlation_id, error_msg);
               let failed_request = { updated_request_claim_attempted with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-              archive_completed_request(failed_request);
+              update_claim_request(failed_request);  // Keep in active array for retry
               return;
             } else {
               // Balance changed, claim succeeded despite error
@@ -1702,7 +1702,7 @@ shared (deployer) persistent actor class SneedLock() = this {
             let error_msg = "Failed to verify balance after claim error: " # debug_show(balance_err);
             log_error(request.caller, correlation_id, error_msg);
             let failed_request = { updated_request_claim_attempted with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-            archive_completed_request(failed_request);
+            update_claim_request(failed_request);  // Keep in active array for retry
             return;
           };
         };
@@ -1743,7 +1743,7 @@ shared (deployer) persistent actor class SneedLock() = this {
         let error_msg = "Failed to get balance after claim: " # debug_show(err);
         log_error(request.caller, correlation_id, error_msg);
         let failed_request = { updated_request_verified with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-        archive_completed_request(failed_request);
+        update_claim_request(failed_request);  // Keep in active array for retry
         return;
       };
     };
@@ -1768,7 +1768,7 @@ shared (deployer) persistent actor class SneedLock() = this {
           let error_msg = "Failed to withdraw token0: " # debug_show(err);
           log_error(request.caller, correlation_id, error_msg);
           let failed_request = { updated_request_verified with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-          archive_completed_request(failed_request);
+          update_claim_request(failed_request);  // Keep in active array for retry - FUNDS ARE STUCK ON BACKEND!
           return;
         };
       };
@@ -1796,7 +1796,7 @@ shared (deployer) persistent actor class SneedLock() = this {
           let error_msg = "Failed to withdraw token1: " # debug_show(err);
           log_error(request.caller, correlation_id, error_msg);
           let failed_request = { updated_request_verified with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-          archive_completed_request(failed_request);
+          update_claim_request(failed_request);  // Keep in active array for retry - FUNDS ARE STUCK ON BACKEND!
           return;
         };
       };
@@ -2153,11 +2153,195 @@ shared (deployer) persistent actor class SneedLock() = this {
         #Ok("Request " # debug_show(request_id) # " reset to pending and queued for retry");
       };
       case null {
-        // Maybe it's in the completed buffer?
-        let msg = "Request " # debug_show(request_id) # " not found in active requests. If it's completed, it cannot be retried.";
-        log_info(caller, correlation_id, msg);
-        #Err(msg);
+        // Check if it's in the completed buffer
+        let buffer_entries = Array.freeze(CircularBuffer.CircularBufferLogic.to_array(completed_claim_requests_buffer));
+        var found_in_completed = false;
+        
+        for (entry_opt in buffer_entries.vals()) {
+          switch (entry_opt) {
+            case (?entry) {
+              if (entry.id == request_id) {
+                found_in_completed := true;
+              };
+            };
+            case null {};
+          };
+        };
+        
+        if (found_in_completed) {
+          let msg = "Request " # debug_show(request_id) # " is in the completed buffer. It cannot be automatically retried from there. If funds are stuck (claim succeeded but withdrawal failed), please use admin_manual_withdraw_for_request(" # debug_show(request_id) # ") to rescue them.";
+          log_info(caller, correlation_id, msg);
+          #Err(msg);
+        } else {
+          let msg = "Request " # debug_show(request_id) # " not found in active or completed requests.";
+          log_info(caller, correlation_id, msg);
+          #Err(msg);
+        };
       };
+    };
+  };
+
+  // Admin: Manually withdraw stuck funds for a specific request
+  // This rescues funds when claim succeeded but withdrawal failed
+  public shared ({ caller }) func admin_manual_withdraw_for_request(request_id : ClaimRequestId) : async {
+    #Ok : Text;
+    #Err : Text;
+  } {
+    if (caller != sneed_governance and caller != admin) {
+      Debug.trap("Only admin can manually withdraw");
+    };
+
+    let correlation_id = get_next_correlation_id();
+    log_info(caller, correlation_id, "Admin manual withdraw for request " # debug_show(request_id));
+    
+    // Find the request in active requests
+    let request_opt = Array.find<ClaimRequest>(stable_claim_requests, func (req) {
+      req.request_id == request_id
+    });
+
+    let request = switch (request_opt) {
+      case (?req) { req };
+      case null {
+        let msg = "Request " # debug_show(request_id) # " not found in active requests. Cannot withdraw.";
+        log_error(caller, correlation_id, msg);
+        return #Err(msg);
+      };
+    };
+
+    log_info(caller, correlation_id, "Found request: caller=" # debug_show(request.caller) # ", swap=" # debug_show(request.swap_canister_id) # ", status=" # debug_show(request.status));
+
+    // Get ICPSwap swap canister actor
+    let swap_canister = actor (Principal.toText(request.swap_canister_id)) : actor {
+      getUserUnusedBalance : (principal : Principal) -> async { #ok : { balance0 : Nat; balance1 : Nat }; #err : T.SwapCanisterError };
+      withdrawToSubaccount : (args : {
+        amount : Nat;
+        fee : Nat;
+        subaccount : Blob;
+        token : Text;
+      }) -> async { #ok : Nat; #err : T.SwapCanisterError };
+    };
+    
+    // Get token ledger actors
+    let token0_ledger = actor (Principal.toText(request.token0)) : actor { icrc1_fee : () -> async Nat };
+    let token1_ledger = actor (Principal.toText(request.token1)) : actor { icrc1_fee : () -> async Nat };
+    
+    let token0_fee = await token0_ledger.icrc1_fee();
+    let token1_fee = await token1_ledger.icrc1_fee();
+
+    log_info(caller, correlation_id, "Token fees: token0=" # debug_show(token0_fee) # ", token1=" # debug_show(token1_fee));
+
+    // Get current backend balance on swap canister
+    let balance_result = await swap_canister.getUserUnusedBalance(this_canister_id());
+    let (balance0, balance1) = switch (balance_result) {
+      case (#ok(balances)) { (balances.balance0, balances.balance1) };
+      case (#err(err)) {
+        let msg = "Failed to get backend balance: " # debug_show(err);
+        log_error(caller, correlation_id, msg);
+        return #Err(msg);
+      };
+    };
+
+    log_info(caller, correlation_id, "Current backend balance: token0=" # debug_show(balance0) # ", token1=" # debug_show(balance1));
+
+    // Check if there's anything to withdraw
+    if (balance0 <= token0_fee and balance1 <= token1_fee) {
+      let msg = "Nothing to withdraw. Token0 balance (" # debug_show(balance0) # ") <= fee (" # debug_show(token0_fee) # "), Token1 balance (" # debug_show(balance1) # ") <= fee (" # debug_show(token1_fee) # ")";
+      log_info(caller, correlation_id, msg);
+      return #Ok(msg);
+    };
+
+    // Calculate subaccount for the original caller
+    let caller_subaccount = PrincipalToSubaccount(request.caller);
+
+    var withdrawn0 : Balance = 0;
+    var withdrawn1 : Balance = 0;
+    var errors : Text = "";
+
+    // Attempt to withdraw token0 if balance is sufficient
+    if (balance0 > token0_fee) {
+      let withdraw0_amount = balance0 - token0_fee;
+      log_info(caller, correlation_id, "Attempting to withdraw token0: amount=" # debug_show(withdraw0_amount) # ", fee=" # debug_show(token0_fee));
+      
+      let withdraw0_result = await swap_canister.withdrawToSubaccount({
+        amount = withdraw0_amount;
+        fee = token0_fee;
+        subaccount = Blob.fromArray(caller_subaccount);
+        token = Principal.toText(request.token0);
+      });
+      
+      switch (withdraw0_result) {
+        case (#ok(_)) {
+          withdrawn0 := withdraw0_amount;
+          log_info(caller, correlation_id, "Successfully withdrew token0: " # debug_show(withdraw0_amount));
+        };
+        case (#err(err)) {
+          let error_msg = "Failed to withdraw token0: " # debug_show(err);
+          log_error(caller, correlation_id, error_msg);
+          errors := errors # error_msg # "; ";
+        };
+      };
+    } else if (balance0 > 0) {
+      log_info(caller, correlation_id, "Token0 balance (" # debug_show(balance0) # ") <= fee (" # debug_show(token0_fee) # "), skipping");
+    };
+
+    // Attempt to withdraw token1 if balance is sufficient
+    if (balance1 > token1_fee) {
+      let withdraw1_amount = balance1 - token1_fee;
+      log_info(caller, correlation_id, "Attempting to withdraw token1: amount=" # debug_show(withdraw1_amount) # ", fee=" # debug_show(token1_fee));
+      
+      let withdraw1_result = await swap_canister.withdrawToSubaccount({
+        amount = withdraw1_amount;
+        fee = token1_fee;
+        subaccount = Blob.fromArray(caller_subaccount);
+        token = Principal.toText(request.token1);
+      });
+      
+      switch (withdraw1_result) {
+        case (#ok(_)) {
+          withdrawn1 := withdraw1_amount;
+          log_info(caller, correlation_id, "Successfully withdrew token1: " # debug_show(withdraw1_amount));
+        };
+        case (#err(err)) {
+          let error_msg = "Failed to withdraw token1: " # debug_show(err);
+          log_error(caller, correlation_id, error_msg);
+          errors := errors # error_msg # "; ";
+        };
+      };
+    } else if (balance1 > 0) {
+      log_info(caller, correlation_id, "Token1 balance (" # debug_show(balance1) # ") <= fee (" # debug_show(token1_fee) # "), skipping");
+    };
+
+    // Update request status if both withdrawals succeeded
+    if (withdrawn0 > 0 or withdrawn1 > 0) {
+      if (errors == "") {
+        // All successful, mark as completed
+        let completed_request = {
+          request with 
+          status = #Completed;
+          completed_at = ?TimeAsNat64(Time.now());
+        };
+        archive_completed_request(completed_request);
+        
+        let success_msg = "Successfully withdrew: token0=" # debug_show(withdrawn0) # ", token1=" # debug_show(withdrawn1) # ". Request marked as completed.";
+        log_info(caller, correlation_id, success_msg);
+        #Ok(success_msg);
+      } else {
+        // Partial success
+        let updated_request = {
+          request with 
+          status = #Failed("Partial withdrawal: " # errors);
+          completed_at = ?TimeAsNat64(Time.now());
+        };
+        update_claim_request(updated_request);
+        
+        let partial_msg = "Partially withdrew: token0=" # debug_show(withdrawn0) # ", token1=" # debug_show(withdrawn1) # ". Errors: " # errors;
+        log_info(caller, correlation_id, partial_msg);
+        #Ok(partial_msg);
+      };
+    } else {
+      let fail_msg = "Failed to withdraw anything. Errors: " # errors;
+      log_error(caller, correlation_id, fail_msg);
+      #Err(fail_msg);
     };
   };
 

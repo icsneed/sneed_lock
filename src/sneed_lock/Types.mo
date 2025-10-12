@@ -161,5 +161,15 @@ module {
         #Ok;
         #Err : TransferPositionOwnershipError;
     };
+
+    public type TransferTokenLockOwnershipError = {
+        message : Text;
+        transfer_error : ?TransferError;
+    };
+
+    public type TransferTokenLockOwnershipResult = {
+        #Ok;
+        #Err : TransferTokenLockOwnershipError;
+    };
     // TODO: this can give us guid/uuid??: https://github.com/aviate-labs/uuid.mo
 };

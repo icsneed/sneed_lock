@@ -107,6 +107,10 @@ export interface SneedLock {
     [Principal, SwapCanisterId, PositionId],
     TransferPositionOwnershipResult
   >,
+  'transfer_token_lock_ownership' : ActorMethod<
+    [Principal, TokenType, LockId],
+    TransferTokenLockOwnershipResult
+  >,
   'transfer_tokens' : ActorMethod<
     [Principal, [] | [Subaccount], Principal, Balance],
     TransferResult
@@ -141,6 +145,12 @@ export type TransferPositionResult = { 'ok' : boolean } |
   { 'err' : TransferPositionError };
 export type TransferResult = { 'Ok' : TxIndex } |
   { 'Err' : TransferError };
+export interface TransferTokenLockOwnershipError {
+  'transfer_error' : [] | [TransferError],
+  'message' : string,
+}
+export type TransferTokenLockOwnershipResult = { 'Ok' : null } |
+  { 'Err' : TransferTokenLockOwnershipError };
 export type TxIndex = bigint;
 export interface _SERVICE extends SneedLock {}
 export declare const idlFactory: IDL.InterfaceFactory;

@@ -1,4 +1,14 @@
 type TxIndex = nat;
+type TransferTokenLockOwnershipResult = 
+ variant {
+   Err: TransferTokenLockOwnershipError;
+   Ok;
+ };
+type TransferTokenLockOwnershipError = 
+ record {
+   message: text;
+   transfer_error: opt TransferError;
+ };
 type TransferResult = 
  variant {
    Err: TransferError;
@@ -100,6 +110,8 @@ type SneedLock =
    transfer_position_ownership: (to_principal: principal, swap_canister_id:
     SwapCanisterId, position_id: PositionId) ->
     (TransferPositionOwnershipResult);
+   transfer_token_lock_ownership: (to_principal: principal, token_type:
+    TokenType, lock_id: LockId) -> (TransferTokenLockOwnershipResult);
    transfer_tokens: (to_principal: principal, to_subaccount: opt Subaccount,
     icrc1_ledger_canister_id: principal, amount: Balance) -> (TransferResult);
    update_position_lock: (swap_canister_id: principal, position_id:

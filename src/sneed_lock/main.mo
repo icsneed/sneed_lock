@@ -56,6 +56,8 @@ shared (deployer) actor class SneedLock() = this {
   type BufferEntry = CircularBuffer.BufferEntry;
   type TransferPositionOwnershipResult = T.TransferPositionOwnershipResult;
   type TransferPositionOwnershipError = T.TransferPositionOwnershipError;
+  type TransferTokenLockOwnershipResult = T.TransferTokenLockOwnershipResult;
+  type TransferTokenLockOwnershipError = T.TransferTokenLockOwnershipError;
 
   // consts
   let transaction_fee_sneed_e8s : Nat = 1000;
@@ -542,6 +544,136 @@ shared (deployer) actor class SneedLock() = this {
 
     log_info(caller, correlation_id, "Successfully transferred position ownership from " # debug_show(caller) # " to " # debug_show(to_principal) # " for position " # debug_show(position_id));
     #Ok;
+  };
+
+  private func find_and_remove_token_lock(principal : Principal, token_type : T.TokenType, lock_id : T.LockId) : ?Lock {
+    let allLocks = switch (state.principal_token_locks.get(principal)) {
+      case (?_tokenLocks) _tokenLocks;
+      case _ HashMap.HashMap<TokenType, Locks>(10, Principal.equal, Principal.hash);
+    };
+
+    let locks = switch (allLocks.get(token_type)) {
+      case (?existingLocks) existingLocks;
+      case _ List.nil<Lock>();
+    };
+
+    // Find the lock with the specified lock_id
+    var foundLock : ?Lock = null;
+    let locksIter : Iter.Iter<Lock> = List.toIter<Lock>(locks);
+    for (lock in locksIter) {
+      if (lock.lock_id == lock_id) {
+        foundLock := ?lock;
+      };
+    };
+
+    // Remove the lock from the list if found
+    switch (foundLock) {
+      case (?lock) {
+        let filteredLocks = List.filter<Lock>(locks, func (l) { l.lock_id != lock_id; });
+        allLocks.put(token_type, filteredLocks);
+        state.principal_token_locks.put(principal, allLocks);
+      };
+      case null {};
+    };
+
+    foundLock;
+  };
+
+  public shared ({ caller }) func transfer_token_lock_ownership(
+    to_principal : Principal,
+    token_type : T.TokenType,
+    lock_id : T.LockId
+  ) : async TransferTokenLockOwnershipResult {
+    let correlation_id = get_next_correlation_id();
+    log_info(caller, correlation_id, "Transferring token lock " # debug_show(lock_id) # " from " # debug_show(caller) # " to " # debug_show(to_principal) # " for token " # debug_show(token_type));
+
+    // Find and remove the lock from the caller
+    let lock = find_and_remove_token_lock(caller, token_type, lock_id);
+
+    switch (lock) {
+      case null {
+        let error = #Err({
+          message = "Lock " # debug_show(lock_id) # " not found for caller " # debug_show(caller) # " and token " # debug_show(token_type);
+          transfer_error = null;
+        });
+        log_error(caller, correlation_id, debug_show(error));
+        return error;
+      };
+      case (?found_lock) {
+        // Verify the lock hasn't expired
+        let now = NowAsNat64();
+        if (found_lock.expiry <= now) {
+          // Re-add the lock back since it was removed
+          add_lock_for_principal(caller, token_type, found_lock);
+          let error = #Err({
+            message = "Lock " # debug_show(lock_id) # " has expired. Expiry: " # debug_show(found_lock.expiry) # ", Now: " # debug_show(now);
+            transfer_error = null;
+          });
+          log_error(caller, correlation_id, debug_show(error));
+          return error;
+        };
+
+        // Verify the caller's subaccount has the locked balance
+        let icrc1_ledger_canister = actor (Principal.toText(token_type)) : actor {
+          icrc1_transfer(args : TransferArgs) : async T.TransferResult;
+          icrc1_balance_of(account : Account) : async Nat;
+          icrc1_fee() : async T.Balance;
+        };
+
+        let caller_subaccount = PrincipalToSubaccount(caller);
+        let caller_account : T.Account = { owner = this_canister_id(); subaccount = ?Blob.fromArray(caller_subaccount); };
+        let caller_balance = await icrc1_ledger_canister.icrc1_balance_of(caller_account);
+
+        if (caller_balance < found_lock.amount) {
+          // Re-add the lock back since verification failed
+          add_lock_for_principal(caller, token_type, found_lock);
+          let error = #Err({
+            message = "Insufficient balance in caller's subaccount. Has: " # Nat.toText(caller_balance) # ", Required: " # Nat.toText(found_lock.amount);
+            transfer_error = null;
+          });
+          log_error(caller, correlation_id, debug_show(error));
+          return error;
+        };
+
+        // Transfer the tokens from caller's subaccount to recipient's subaccount
+        let recipient_subaccount = PrincipalToSubaccount(to_principal);
+        let recipient_account : T.Account = { owner = this_canister_id(); subaccount = ?Blob.fromArray(recipient_subaccount); };
+
+        let transfer_args : TransferArgs = {
+          from_subaccount = ?Blob.fromArray(caller_subaccount);
+          to = recipient_account;
+          amount = found_lock.amount;
+          fee = null;
+          memo = null;
+          created_at_time = null;
+        };
+
+        let transfer_result = await icrc1_ledger_canister.icrc1_transfer(transfer_args);
+
+        switch (transfer_result) {
+          case (#Err(transfer_error)) {
+            // Re-add the lock back since transfer failed
+            add_lock_for_principal(caller, token_type, found_lock);
+            let error = #Err({
+              message = "Failed to transfer tokens from caller's subaccount to recipient's subaccount";
+              transfer_error = ?transfer_error;
+            });
+            log_error(caller, correlation_id, "Token transfer failed: " # debug_show(error));
+            return error;
+          };
+          case (#Ok(tx_index)) {
+            log_info(caller, correlation_id, "Transferred " # Nat.toText(found_lock.amount) # " tokens from " # debug_show(caller) # " to " # debug_show(to_principal) # " with tx_index: " # debug_show(tx_index));
+
+            // Add the lock to the recipient
+            add_lock_for_principal(to_principal, token_type, found_lock);
+            log_info(caller, correlation_id, "Transferred lock " # debug_show(lock_id) # " from " # debug_show(caller) # " to " # debug_show(to_principal) # ": " # debug_show(found_lock));
+
+            log_info(caller, correlation_id, "Successfully transferred token lock ownership from " # debug_show(caller) # " to " # debug_show(to_principal) # " for lock " # debug_show(lock_id));
+            #Ok;
+          };
+        };
+      };
+    };
   };
 
   private func verify_position_ownership(caller : Principal, swap_canister_id : Principal, position_id : T.PositionId) : async Bool {

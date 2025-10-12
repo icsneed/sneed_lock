@@ -78,6 +78,14 @@ export const idlFactory = ({ IDL }) => {
     'Ok' : IDL.Null,
     'Err' : TransferPositionOwnershipError,
   });
+  const TransferTokenLockOwnershipError = IDL.Record({
+    'transfer_error' : IDL.Opt(TransferError),
+    'message' : IDL.Text,
+  });
+  const TransferTokenLockOwnershipResult = IDL.Variant({
+    'Ok' : IDL.Null,
+    'Err' : TransferTokenLockOwnershipError,
+  });
   const Subaccount = IDL.Vec(IDL.Nat8);
   const SneedLock = IDL.Service({
     'admin_return_token' : IDL.Func(
@@ -180,6 +188,11 @@ export const idlFactory = ({ IDL }) => {
     'transfer_position_ownership' : IDL.Func(
         [IDL.Principal, SwapCanisterId, PositionId],
         [TransferPositionOwnershipResult],
+        [],
+      ),
+    'transfer_token_lock_ownership' : IDL.Func(
+        [IDL.Principal, TokenType, LockId],
+        [TransferTokenLockOwnershipResult],
         [],
       ),
     'transfer_tokens' : IDL.Func(

@@ -100,9 +100,11 @@ shared (deployer) persistent actor class SneedLock() = this {
   stable var enforce_zero_balance_before_claim : Bool = true; // Safety check: balance must be 0 before claiming
   stable var last_timer_execution_time : ?T.Timestamp = null; // When timer last executed
   stable var last_timer_execution_correlation_id : ?Nat = null; // Correlation ID of last execution
+
+  // shouldn't be stable but is for legacy reasons. 
+  stable var claim_processing_timer_id : ?Nat = null;
   
   // Ephemeral timer state (not stable - timer IDs don't persist across upgrades)
-  transient var claim_processing_timer_id : ?Nat = null;
   transient var next_scheduled_timer_time : ?T.Timestamp = null;
 
   transient let admin = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
@@ -1817,6 +1819,46 @@ shared (deployer) persistent actor class SneedLock() = this {
     Array.filter<ClaimRequest>(stable_claim_requests, func (req) { req.caller == caller });
   };
 
+  // Query: Get all active claim requests (no caller filter)
+  public query func get_all_active_claim_requests() : async [ClaimRequest] {
+    stable_claim_requests;
+  };
+
+  // Query: Get all completed claim requests (from circular buffer, as Text)
+  public query func get_all_completed_claim_requests() : async [Text] {
+    var result : [Text] = [];
+    
+    // Get ID range
+    switch (CircularBuffer.CircularBufferLogic.get_id_range(completed_claim_requests_buffer)) {
+      case (?(start_id, end_id)) {
+        // Fetch all entries
+        let entries = CircularBuffer.CircularBufferLogic.get_entries_by_id(
+          completed_claim_requests_buffer,
+          start_id,
+          end_id - start_id + 1
+        );
+        
+        // Extract claim request text from entries
+        let requests = Array.mapFilter<?BufferEntry, Text>(
+          entries,
+          func(entry_opt) {
+            switch (entry_opt) {
+              case (?entry) { ?entry.content };
+              case null { null };
+            };
+          }
+        );
+        result := requests;
+      };
+      case null {
+        // Buffer is empty
+        result := [];
+      };
+    };
+    
+    result;
+  };
+
   // Query: Get active claim request by ID (pending/processing)
   public query func get_active_claim_request(request_id : ClaimRequestId) : async ?ClaimRequest {
     Array.find<ClaimRequest>(stable_claim_requests, func (req) { req.request_id == request_id });
@@ -1989,6 +2031,134 @@ shared (deployer) persistent actor class SneedLock() = this {
     };
     
     removed;
+  };
+
+  // Admin: Manually trigger claim queue processing (immediate execution)
+  public shared ({ caller }) func admin_trigger_claim_processing() : async Text {
+    if (caller != sneed_governance and caller != admin) {
+      Debug.trap("Only admin can manually trigger claim processing");
+    };
+
+    let correlation_id = get_next_correlation_id();
+    
+    // Check if there are pending requests
+    let pending_request = get_oldest_pending_request();
+    if (pending_request == null) {
+      log_info(caller, correlation_id, "No pending requests in queue");
+      return "No pending requests to process";
+    };
+
+    // Check if already processing
+    switch (claim_processing_timer_id) {
+      case (?timer_id) {
+        log_info(caller, correlation_id, "Timer already active (ID: " # debug_show(timer_id) # ")");
+        return "Timer already active";
+      };
+      case null {
+        // Ensure queue is active
+        claim_queue_processing_state := #Active;
+        
+        // Start timer immediately
+        let timer_id = Timer.setTimer<system>(#seconds(0), process_claim_queue);
+        claim_processing_timer_id := ?timer_id;
+        next_scheduled_timer_time := ?TimeAsNat64(Time.now());
+        
+        log_info(caller, correlation_id, "Manually triggered claim processing (Timer ID: " # debug_show(timer_id) # ")");
+        return "Processing started with timer ID: " # debug_show(timer_id);
+      };
+    };
+  };
+
+  // Admin: Retry a specific claim request (reset to pending status)
+  public shared ({ caller }) func admin_retry_claim_request(request_id : ClaimRequestId) : async {
+    #Ok : Text;
+    #Err : Text;
+  } {
+    if (caller != sneed_governance and caller != admin) {
+      Debug.trap("Only admin can retry claim requests");
+    };
+
+    let correlation_id = get_next_correlation_id();
+    
+    // Find the request in active requests
+    let request_opt = Array.find<ClaimRequest>(stable_claim_requests, func (req) {
+      req.request_id == request_id
+    });
+
+    switch (request_opt) {
+      case (?request) {
+        // Check if request is in a retryable state
+        let is_retryable = switch (request.status) {
+          case (#Failed(_)) { true };
+          case (#TimedOut) { true };
+          case (#Pending) { false }; // Already pending
+          case (#Processing) { false }; // Currently processing
+          case (#BalanceRecorded(_)) { false };
+          case (#ClaimAttempted(_)) { false };
+          case (#ClaimVerified(_)) { false };
+          case (#Withdrawn(_)) { false };
+          case (#Completed) { false };
+        };
+
+        if (not is_retryable) {
+          let msg = "Request " # debug_show(request_id) # " is not in a retryable state (current status: " # debug_show(request.status) # ")";
+          log_info(caller, correlation_id, msg);
+          return #Err(msg);
+        };
+
+        // Reset to pending
+        let updated_request : ClaimRequest = {
+          request_id = request.request_id;
+          caller = request.caller;
+          swap_canister_id = request.swap_canister_id;
+          position_id = request.position_id;
+          token0 = request.token0;
+          token1 = request.token1;
+          status = #Pending;
+          created_at = request.created_at;
+          started_processing_at = null;
+          completed_at = null;
+        };
+
+        // Update in array
+        stable_claim_requests := Array.map<ClaimRequest, ClaimRequest>(
+          stable_claim_requests,
+          func (req) {
+            if (req.request_id == request_id) {
+              updated_request
+            } else {
+              req
+            }
+          }
+        );
+
+        log_info(caller, correlation_id, "Reset claim request " # debug_show(request_id) # " to pending status");
+        
+        // If queue is active and no timer running, start it
+        switch (claim_queue_processing_state) {
+          case (#Active) {
+            switch (claim_processing_timer_id) {
+              case null {
+                ignore start_claim_queue_processor();
+                log_info(caller, correlation_id, "Started queue processor for retried request");
+              };
+              case (?_) {}; // Already running
+            };
+          };
+          case (#Paused(reason)) {
+            log_info(caller, correlation_id, "Queue is paused (" # reason # "), request reset but not processing");
+          };
+        };
+
+        #Ok("Request " # debug_show(request_id) # " reset to pending and queued for retry");
+      };
+      case null {
+        // Maybe it's in the completed buffer?
+        let msg = "Request " # debug_show(request_id) # " not found in active requests. If it's completed, it cannot be retried.";
+        log_info(caller, correlation_id, msg);
+        #Err(msg);
+      };
+    };
   };
 
   // Admin: Set zero balance enforcement flag

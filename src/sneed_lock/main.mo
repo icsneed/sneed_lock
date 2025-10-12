@@ -1561,6 +1561,7 @@ shared (deployer) persistent actor class SneedLock() = this {
     let swap_canister = actor (Principal.toText(request.swap_canister_id)) : actor {
       claim : (args : { positionId : Nat }) -> async { #ok : { amount0 : Nat; amount1 : Nat }; #err : T.SwapCanisterError };
       getUserUnusedBalance : (principal : Principal) -> async { #ok : { balance0 : Nat; balance1 : Nat }; #err : T.SwapCanisterError };
+      getUserPosition : (positionId : Nat) -> async { #ok : { tokensOwed0 : Nat; tokensOwed1 : Nat; liquidity : Nat; feeGrowthInside0LastX128 : Nat; feeGrowthInside1LastX128 : Nat }; #err : T.SwapCanisterError };
       withdrawToSubaccount : (args : {
         amount : Nat;
         fee : Nat;
@@ -1568,6 +1569,39 @@ shared (deployer) persistent actor class SneedLock() = this {
         token : Text;
       }) -> async { #ok : Nat; #err : T.SwapCanisterError };
     };
+
+    // Step 0: Get token fees and check if there's enough to claim
+    let token0_ledger = actor (Principal.toText(request.token0)) : actor { icrc1_fee : () -> async Nat };
+    let token1_ledger = actor (Principal.toText(request.token1)) : actor { icrc1_fee : () -> async Nat };
+    let token0_fee = await token0_ledger.icrc1_fee();
+    let token1_fee = await token1_ledger.icrc1_fee();
+
+    // Get current claimable amounts
+    let position_info_result = await swap_canister.getUserPosition(request.position_id);
+    let (tokens_owed0, tokens_owed1) = switch (position_info_result) {
+      case (#ok(info)) { (info.tokensOwed0, info.tokensOwed1) };
+      case (#err(err)) {
+        let error_msg = "Failed to get position info: " # debug_show(err);
+        log_error(request.caller, correlation_id, error_msg);
+        let failed_request = { request with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+        archive_completed_request(failed_request);
+        return;
+      };
+    };
+
+    // Check if at least one token has enough to claim (need at least 2x fee: 1x for claim, 1x for withdraw)
+    let token0_has_enough = tokens_owed0 >= (2 * token0_fee);
+    let token1_has_enough = tokens_owed1 >= (2 * token1_fee);
+
+    if (not token0_has_enough and not token1_has_enough) {
+      let error_msg = "Insufficient rewards to claim. Token0: " # debug_show(tokens_owed0) # " (need >= " # debug_show(2 * token0_fee) # "), Token1: " # debug_show(tokens_owed1) # " (need >= " # debug_show(2 * token1_fee) # ")";
+      log_error(request.caller, correlation_id, error_msg);
+      let failed_request = { request with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+      archive_completed_request(failed_request);
+      return;
+    };
+
+    log_info(request.caller, correlation_id, "Position has claimable rewards - Token0: " # debug_show(tokens_owed0) # " (fee: " # debug_show(token0_fee) # ", enough: " # debug_show(token0_has_enough) # "), Token1: " # debug_show(tokens_owed1) # " (fee: " # debug_show(token1_fee) # ", enough: " # debug_show(token1_has_enough) # ")");
 
     // Step 1: Record balance before claim
     let balance_result = await swap_canister.getUserUnusedBalance(this_canister_id());
@@ -1653,12 +1687,6 @@ shared (deployer) persistent actor class SneedLock() = this {
 
     // Step 3: Withdraw to caller's subaccount
     let caller_subaccount = PrincipalToSubaccount(request.caller);
-    
-    // Get token fees
-    let token0_ledger = actor (Principal.toText(request.token0)) : actor { icrc1_fee : () -> async Nat };
-    let token1_ledger = actor (Principal.toText(request.token1)) : actor { icrc1_fee : () -> async Nat };
-    let token0_fee = await token0_ledger.icrc1_fee();
-    let token1_fee = await token1_ledger.icrc1_fee();
 
     // Withdraw token0 if amount > fee (need to subtract fee from claimed amount)
     if (amount0_claimed > token0_fee) {
@@ -1728,6 +1756,33 @@ shared (deployer) persistent actor class SneedLock() = this {
   // Query: Get active claim request by ID (pending/processing)
   public query func get_active_claim_request(request_id : ClaimRequestId) : async ?ClaimRequest {
     Array.find<ClaimRequest>(stable_claim_requests, func (req) { req.request_id == request_id });
+  };
+
+  // Query: Get claim request status by ID (searches both active and completed)
+  public query func get_claim_request_status(request_id : ClaimRequestId) : async ?{
+    #Active : ClaimRequest;
+    #Completed : Text; // The full request as debug text
+  } {
+    // First check active requests
+    switch (Array.find<ClaimRequest>(stable_claim_requests, func (req) { req.request_id == request_id })) {
+      case (?active_req) { return ?#Active(active_req); };
+      case null {
+        // Search completed requests in circular buffer
+        let buffer_entries = Array.freeze(CircularBuffer.CircularBufferLogic.to_array(completed_claim_requests_buffer));
+        for (entry_opt in buffer_entries.vals()) {
+          switch (entry_opt) {
+            case (?entry) {
+              // The entry.id is the request_id we stored
+              if (entry.id == request_id) {
+                return ?#Completed(entry.content);
+              };
+            };
+            case null {};
+          };
+        };
+        return null;
+      };
+    };
   };
 
   // Query: Get completed claim requests from circular buffer

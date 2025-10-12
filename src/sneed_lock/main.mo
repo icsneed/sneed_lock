@@ -96,9 +96,14 @@ shared (deployer) persistent actor class SneedLock() = this {
   stable var completed_claim_requests_buffer : CircularBuffer = CircularBuffer.CircularBufferLogic.create(1_000); // Completed requests circular buffer
   stable var next_claim_request_id : Nat = 0;
   stable var claim_queue_processing_state : QueueProcessingState = #Active;
-  stable var claim_processing_timer_id : ?Nat = null;
   stable var claim_requests_processed_in_batch : Nat = 0;
   stable var enforce_zero_balance_before_claim : Bool = true; // Safety check: balance must be 0 before claiming
+  stable var last_timer_execution_time : ?T.Timestamp = null; // When timer last executed
+  stable var last_timer_execution_correlation_id : ?Nat = null; // Correlation ID of last execution
+  
+  // Ephemeral timer state (not stable - timer IDs don't persist across upgrades)
+  transient var claim_processing_timer_id : ?Nat = null;
+  transient var next_scheduled_timer_time : ?T.Timestamp = null;
 
   transient let admin = Principal.fromText("d7zib-qo5mr-qzmpb-dtyof-l7yiu-pu52k-wk7ng-cbm3n-ffmys-crbkz-nae");
   transient let sneed_governance = Principal.fromText("fi3zi-fyaaa-aaaaq-aachq-cai");
@@ -1464,6 +1469,7 @@ shared (deployer) persistent actor class SneedLock() = this {
         // Start with 0 second delay
         let timer_id = Timer.setTimer<system>(#seconds(0), process_claim_queue);
         claim_processing_timer_id := ?timer_id;
+        next_scheduled_timer_time := ?TimeAsNat64(Time.now()); // Immediate execution
       };
     };
   };
@@ -1472,11 +1478,16 @@ shared (deployer) persistent actor class SneedLock() = this {
   private func process_claim_queue() : async () {
     let correlation_id = get_next_correlation_id();
     
+    // Record execution
+    last_timer_execution_time := ?TimeAsNat64(Time.now());
+    last_timer_execution_correlation_id := ?correlation_id;
+    
     // Check if processing is paused
     switch (claim_queue_processing_state) {
       case (#Paused(reason)) {
         log_info(Principal.fromText("2vxsx-fae"), correlation_id, "Claim queue processing is paused: " # reason);
         claim_processing_timer_id := null;
+        next_scheduled_timer_time := null;
         return;
       };
       case (#Active) {};
@@ -1488,6 +1499,7 @@ shared (deployer) persistent actor class SneedLock() = this {
         // Queue is empty
         log_info(Principal.fromText("2vxsx-fae"), correlation_id, "Claim queue is empty, stopping processor");
         claim_processing_timer_id := null;
+        next_scheduled_timer_time := null;
         claim_requests_processed_in_batch := 0;
         return;
       };
@@ -1512,6 +1524,7 @@ shared (deployer) persistent actor class SneedLock() = this {
           // Pause processing
           claim_queue_processing_state := #Paused("Request " # debug_show(request.request_id) # " timed out");
           claim_processing_timer_id := null;
+          next_scheduled_timer_time := null;
           return;
         };
 
@@ -1534,6 +1547,7 @@ shared (deployer) persistent actor class SneedLock() = this {
               claim_requests_processed_in_batch := 0;
               let timer_id = Timer.setTimer<system>(#nanoseconds(Nat64.toNat(batch_pause_duration_ns)), process_claim_queue);
               claim_processing_timer_id := ?timer_id;
+              next_scheduled_timer_time := ?(TimeAsNat64(Time.now()) + batch_pause_duration_ns);
               return;
             };
           };
@@ -1542,6 +1556,7 @@ shared (deployer) persistent actor class SneedLock() = this {
         // Schedule next iteration immediately
         let timer_id = Timer.setTimer<system>(#seconds(0), process_claim_queue);
         claim_processing_timer_id := ?timer_id;
+        next_scheduled_timer_time := ?TimeAsNat64(Time.now()); // Immediate execution
       };
     };
   };
@@ -1906,6 +1921,7 @@ shared (deployer) persistent actor class SneedLock() = this {
       case (?timer_id) {
         Timer.cancelTimer(timer_id);
         claim_processing_timer_id := null;
+        next_scheduled_timer_time := null;
       };
       case null {};
     };
@@ -1924,6 +1940,7 @@ shared (deployer) persistent actor class SneedLock() = this {
       case (?timer_id) {
         Timer.cancelTimer(timer_id);
         claim_processing_timer_id := null;
+        next_scheduled_timer_time := null;
         log_info(caller, correlation_id, "EMERGENCY STOP: Timer " # debug_show(timer_id) # " cancelled");
       };
       case null {
@@ -1989,6 +2006,40 @@ shared (deployer) persistent actor class SneedLock() = this {
   // Query: Get zero balance enforcement status
   public query func get_enforce_zero_balance_before_claim() : async Bool {
     enforce_zero_balance_before_claim;
+  };
+
+  // Query: Get timer status
+  public query func get_timer_status() : async {
+    timer_id : ?Nat;
+    last_execution_time : ?T.Timestamp;
+    last_execution_correlation_id : ?Nat;
+    next_scheduled_time : ?T.Timestamp;
+    time_since_last_execution_seconds : ?Nat64;
+    is_active : Bool;
+  } {
+    let now = TimeAsNat64(Time.now());
+    let time_since_last : ?Nat64 = switch (last_timer_execution_time) {
+      case (?last_time) {
+        if (now >= last_time) {
+          ?((now - last_time) / second_ns)
+        } else {
+          ?0
+        }
+      };
+      case null { null };
+    };
+
+    {
+      timer_id = claim_processing_timer_id;
+      last_execution_time = last_timer_execution_time;
+      last_execution_correlation_id = last_timer_execution_correlation_id;
+      next_scheduled_time = next_scheduled_timer_time;
+      time_since_last_execution_seconds = time_since_last;
+      is_active = switch (claim_processing_timer_id) {
+        case (?_) { true };
+        case null { false };
+      };
+    };
   };
 
   ////////////////

@@ -1660,17 +1660,18 @@ shared (deployer) persistent actor class SneedLock() = this {
     let token0_fee = await token0_ledger.icrc1_fee();
     let token1_fee = await token1_ledger.icrc1_fee();
 
-    // Withdraw token0 if amount > 0
-    if (amount0_claimed > 0) {
+    // Withdraw token0 if amount > fee (need to subtract fee from claimed amount)
+    if (amount0_claimed > token0_fee) {
+      let withdraw0_amount = amount0_claimed - token0_fee;
       let withdraw0_result = await swap_canister.withdrawToSubaccount({
-        amount = amount0_claimed;
+        amount = withdraw0_amount;
         fee = token0_fee;
         subaccount = Blob.fromArray(caller_subaccount);
         token = Principal.toText(request.token0);
       });
       switch (withdraw0_result) {
         case (#ok(_)) {
-          log_info(request.caller, correlation_id, "Withdrew token0: " # debug_show(amount0_claimed));
+          log_info(request.caller, correlation_id, "Withdrew token0: " # debug_show(withdraw0_amount) # " (claimed: " # debug_show(amount0_claimed) # ", fee: " # debug_show(token0_fee) # ")");
         };
         case (#err(err)) {
           let error_msg = "Failed to withdraw token0: " # debug_show(err);
@@ -1680,19 +1681,22 @@ shared (deployer) persistent actor class SneedLock() = this {
           return;
         };
       };
+    } else if (amount0_claimed > 0) {
+      log_info(request.caller, correlation_id, "Token0 claimed amount (" # debug_show(amount0_claimed) # ") <= fee (" # debug_show(token0_fee) # "), skipping withdrawal");
     };
 
-    // Withdraw token1 if amount > 0
-    if (amount1_claimed > 0) {
+    // Withdraw token1 if amount > fee (need to subtract fee from claimed amount)
+    if (amount1_claimed > token1_fee) {
+      let withdraw1_amount = amount1_claimed - token1_fee;
       let withdraw1_result = await swap_canister.withdrawToSubaccount({
-        amount = amount1_claimed;
+        amount = withdraw1_amount;
         fee = token1_fee;
         subaccount = Blob.fromArray(caller_subaccount);
         token = Principal.toText(request.token1);
       });
       switch (withdraw1_result) {
         case (#ok(_)) {
-          log_info(request.caller, correlation_id, "Withdrew token1: " # debug_show(amount1_claimed));
+          log_info(request.caller, correlation_id, "Withdrew token1: " # debug_show(withdraw1_amount) # " (claimed: " # debug_show(amount1_claimed) # ", fee: " # debug_show(token1_fee) # ")");
         };
         case (#err(err)) {
           let error_msg = "Failed to withdraw token1: " # debug_show(err);
@@ -1702,6 +1706,8 @@ shared (deployer) persistent actor class SneedLock() = this {
           return;
         };
       };
+    } else if (amount1_claimed > 0) {
+      log_info(request.caller, correlation_id, "Token1 claimed amount (" # debug_show(amount1_claimed) # ") <= fee (" # debug_show(token1_fee) # "), skipping withdrawal");
     };
 
     // Mark as completed

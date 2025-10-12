@@ -54,6 +54,8 @@ shared (deployer) actor class SneedLock() = this {
   type PrincipalPositionLocksMap = T.PrincipalPositionLocksMap;
   type CircularBuffer = CircularBuffer.CircularBuffer;
   type BufferEntry = CircularBuffer.BufferEntry;
+  type TransferPositionOwnershipResult = T.TransferPositionOwnershipResult;
+  type TransferPositionOwnershipError = T.TransferPositionOwnershipError;
 
   // consts
   let transaction_fee_sneed_e8s : Nat = 1000;
@@ -473,6 +475,73 @@ shared (deployer) actor class SneedLock() = this {
     let new_position_ids = List.filter<T.PositionId>(position_ids, func test_position_id { test_position_id != position_id; } );
     allPositions.put(swap_canister_id, new_position_ids);
     state.principal_position_ownerships.put(principal, allPositions);
+  };
+
+  private func remove_position_lock_from_principal(principal : Principal, swap_canister_id : T.SwapCanisterId, position_id : T.PositionId) : ?T.PositionLock {
+    let allPositionLocks = switch (state.principal_position_locks.get(principal)) {
+      case (?_positionLocks) _positionLocks;
+      case _ HashMap.HashMap<T.SwapCanisterId, T.PositionLocks>(10, Principal.equal, Principal.hash);
+    };
+
+    let positionLocks = switch (allPositionLocks.get(swap_canister_id)) {
+      case (?existingPositionLocks) existingPositionLocks;
+      case _ List.nil<T.PositionLock>();
+    };
+
+    // Find the lock for this position
+    var foundLock : ?T.PositionLock = null;
+    let positionLocksIter : Iter.Iter<T.PositionLock> = List.toIter<T.PositionLock>(positionLocks);
+    for (positionLock in positionLocksIter) {
+      if (positionLock.position_id == position_id) {
+        foundLock := ?positionLock;
+      };
+    };
+
+    // Remove the lock from the list
+    switch (foundLock) {
+      case (?lock) {
+        let filteredPositionLocks = List.filter<T.PositionLock>(positionLocks, func (p) { p.position_id != position_id; });
+        allPositionLocks.put(swap_canister_id, filteredPositionLocks);
+        state.principal_position_locks.put(principal, allPositionLocks);
+      };
+      case null {};
+    };
+
+    foundLock;
+  };
+
+  public shared ({ caller }) func transfer_position_ownership(to_principal : Principal, swap_canister_id : T.SwapCanisterId, position_id : T.PositionId) : async TransferPositionOwnershipResult {
+    let correlation_id = get_next_correlation_id();
+    log_info(caller, correlation_id, "Transferring position ownership from " # debug_show(caller) # " to " # debug_show(to_principal) # " for position " # debug_show(position_id) # " on swap canister " # debug_show(swap_canister_id));
+
+    // Verify that the caller is the current owner
+    if (not has_claimed_position_impl(caller, swap_canister_id, position_id)) {
+      let error = #Err({
+        message = "Caller is not the owner of position " # debug_show(position_id) # " on swap canister " # debug_show(swap_canister_id);
+      });
+      log_error(caller, correlation_id, debug_show(error));
+      return error;
+    };
+
+    // Transfer the position ownership
+    clear_position_claim(caller, swap_canister_id, position_id);
+    add_position_ownership_for_principal(to_principal, swap_canister_id, position_id);
+    log_info(caller, correlation_id, "Transferred position ownership from " # debug_show(caller) # " to " # debug_show(to_principal) # " for position " # debug_show(position_id));
+
+    // If there's a lock on this position, transfer it to the new owner
+    let removed_lock = remove_position_lock_from_principal(caller, swap_canister_id, position_id);
+    switch (removed_lock) {
+      case (?lock) {
+        add_position_lock_for_principal(to_principal, swap_canister_id, lock);
+        log_info(caller, correlation_id, "Transferred position lock from " # debug_show(caller) # " to " # debug_show(to_principal) # " for position " # debug_show(position_id) # ": " # debug_show(lock));
+      };
+      case null {
+        log_info(caller, correlation_id, "No position lock to transfer for position " # debug_show(position_id));
+      };
+    };
+
+    log_info(caller, correlation_id, "Successfully transferred position ownership from " # debug_show(caller) # " to " # debug_show(to_principal) # " for position " # debug_show(position_id));
+    #Ok;
   };
 
   private func verify_position_ownership(caller : Principal, swap_canister_id : Principal, position_id : T.PositionId) : async Bool {

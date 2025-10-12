@@ -1,0 +1,170 @@
+type TxIndex = nat;
+type TransferResult = 
+ variant {
+   Err: TransferError;
+   Ok: TxIndex;
+ };
+type TransferPositionResult = 
+ variant {
+   err: TransferPositionError;
+   ok: bool;
+ };
+type TransferPositionOwnershipResult = 
+ variant {
+   Err: TransferPositionOwnershipError;
+   Ok;
+ };
+type TransferPositionOwnershipError = record {message: text;};
+type TransferPositionError = 
+ variant {
+   CommonError;
+   InsufficientFunds;
+   InternalError: text;
+   UnsupportedToken: text;
+ };
+type TransferError = 
+ variant {
+   BadBurn: record {min_burn_amount: Balance;};
+   BadFee: record {expected_fee: Balance;};
+   CreatedInFuture: record {ledger_time: Timestamp;};
+   Duplicate: record {duplicate_of: TxIndex;};
+   GenericError: record {
+                   error_code: nat;
+                   message: text;
+                 };
+   InsufficientFunds: record {balance: Balance;};
+   TemporarilyUnavailable;
+   TooOld;
+ };
+type TokenType = principal;
+type Timestamp = nat64;
+type SwapCanisterId = principal;
+type Subaccount = blob;
+type SneedLock = 
+ service {
+   admin_return_token: (icrc1_ledger_canister_id: principal, amount: 
+    nat, user_principal: principal) -> (TransferResult);
+   claim_position: (swap_canister_id: principal, position_id: PositionId) ->
+    (bool);
+   clear_expired_locks: () -> ();
+   clear_expired_position_locks: () -> ();
+   create_lock: (amount: nat, icrc1_ledger_canister_id: principal,
+    expires_at: Expiry) -> (CreateLockResult);
+   create_position_lock: (swap_canister_id: principal, dex: Dex, position_id:
+    PositionId, expires_at: Expiry, token0: TokenType, token1: TokenType) ->
+    (CreateLockResult);
+   get_all_position_locks: () -> (vec FullyQualifiedPositionLock) query;
+   get_all_token_locks: () -> (vec FullyQualifiedLock) query;
+   get_claimed_positions_for_principal: (owner: principal) ->
+    (vec ClaimedPosition) query;
+   get_error_entries: (start: nat, length: nat) -> (vec opt BufferEntry);
+   get_error_id_range: () -> (opt record {
+                                    nat;
+                                    nat;
+                                  });
+   get_info_entries: (start: nat, length: nat) -> (vec opt BufferEntry);
+   get_info_id_range: () -> (opt record {
+                                   nat;
+                                   nat;
+                                 });
+   get_ledger_token_locks: (ledger_canister_id: TokenType) ->
+    (vec FullyQualifiedLock) query;
+   get_position_ownerships: () ->
+    (vec record {
+           SwapCanisterId;
+           PositionId;
+         }) query;
+   get_summed_locks: () -> (vec record {
+                                  TokenType;
+                                  Balance;
+                                }) query;
+   get_swap_position_locks: (swap_canister_id: SwapCanisterId) ->
+    (vec FullyQualifiedPositionLock) query;
+   get_token_lock_fee_sneed_e8s: () -> (nat) query;
+   get_token_locks: () ->
+    (vec record {
+           LockId;
+           TokenType;
+           Balance;
+           Expiry;
+         }) query;
+   get_token_position_locks: (token_canister_id: TokenType) ->
+    (vec FullyQualifiedPositionLock) query;
+   has_expired_locks: () -> (bool) query;
+   has_expired_position_locks: () -> (bool) query;
+   set_max_lock_length_days: (new_max_lock_length_days: nat64) -> ();
+   set_token_lock_fee_sneed_e8s: (new_token_lock_fee_sneed_e8s: nat) ->
+    (SetLockFeeResult);
+   transfer_position: (to: principal, swap_canister_id: principal,
+    position_id: PositionId) -> (TransferPositionResult);
+   transfer_position_ownership: (to_principal: principal, swap_canister_id:
+    SwapCanisterId, position_id: PositionId) ->
+    (TransferPositionOwnershipResult);
+   transfer_tokens: (to_principal: principal, to_subaccount: opt Subaccount,
+    icrc1_ledger_canister_id: principal, amount: Balance) -> (TransferResult);
+   update_position_lock: (swap_canister_id: principal, position_id:
+    PositionId, expires_at: Expiry) -> (CreateLockResult);
+ };
+type SetLockFeeResult = 
+ variant {
+   Err: text;
+   Ok: nat;
+ };
+type PositionLock = 
+ record {
+   dex: Dex;
+   expiry: Expiry;
+   lock_id: LockId;
+   position_id: PositionId;
+   token0: TokenType;
+   token1: TokenType;
+ };
+type PositionId = nat;
+type LockId = nat;
+type Lock = 
+ record {
+   amount: Balance;
+   expiry: Expiry;
+   lock_id: LockId;
+ };
+type FullyQualifiedPositionLock = 
+ record {
+   principal;
+   SwapCanisterId;
+   PositionLock;
+ };
+type FullyQualifiedLock = 
+ record {
+   principal;
+   TokenType;
+   Lock;
+ };
+type Expiry = nat64;
+type Dex = nat;
+type CreateLockResult = 
+ variant {
+   Err: CreateLockError;
+   Ok: LockId;
+ };
+type CreateLockError = 
+ record {
+   message: text;
+   transfer_error: opt TransferError;
+ };
+type ClaimedPosition = 
+ record {
+   owner: principal;
+   position_id: PositionId;
+   position_lock: opt PositionLock;
+   swap_canister_id: SwapCanisterId;
+ };
+type BufferEntry = 
+ record {
+   caller: principal;
+   content: text;
+   correlation_id: nat;
+   id: nat;
+   timestamp: int;
+ };
+type Balance = nat;
+service : () -> SneedLock

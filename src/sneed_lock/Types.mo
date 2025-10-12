@@ -152,5 +152,14 @@ module {
         position_id: PositionId;
         position_lock: ?PositionLock;
     };
+
+    public type TransferPositionOwnershipError = {
+        message : Text;
+    };
+
+    public type TransferPositionOwnershipResult = {
+        #Ok;
+        #Err : TransferPositionOwnershipError;
+    };
     // TODO: this can give us guid/uuid??: https://github.com/aviate-labs/uuid.mo
 };

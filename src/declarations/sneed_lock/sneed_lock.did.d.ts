@@ -94,9 +94,9 @@ export type QueueProcessingState = { 'Paused' : string } |
 export type SetLockFeeResult = { 'Ok' : bigint } |
   { 'Err' : string };
 export interface SneedLock {
-  'admin_clear_completed_claim_requests' : ActorMethod<[], bigint>,
+  'admin_clear_completed_claim_requests_buffer' : ActorMethod<[], bigint>,
   'admin_pause_claim_queue' : ActorMethod<[string], undefined>,
-  'admin_remove_claim_request' : ActorMethod<[ClaimRequestId], boolean>,
+  'admin_remove_active_claim_request' : ActorMethod<[ClaimRequestId], boolean>,
   'admin_resume_claim_queue' : ActorMethod<[], undefined>,
   'admin_return_token' : ActorMethod<
     [Principal, bigint, Principal],
@@ -110,6 +110,10 @@ export interface SneedLock {
     [Principal, Dex, PositionId, Expiry, TokenType, TokenType],
     CreateLockResult
   >,
+  'get_active_claim_request' : ActorMethod<
+    [ClaimRequestId],
+    [] | [ClaimRequest]
+  >,
   'get_all_position_locks' : ActorMethod<[], Array<FullyQualifiedPositionLock>>,
   'get_all_token_locks' : ActorMethod<[], Array<FullyQualifiedLock>>,
   'get_claim_queue_status' : ActorMethod<
@@ -117,16 +121,22 @@ export interface SneedLock {
     {
       'pending_count' : bigint,
       'processing_count' : bigint,
-      'completed_count' : bigint,
+      'active_total' : bigint,
+      'completed_buffer_count' : bigint,
       'processing_state' : QueueProcessingState,
-      'total_count' : bigint,
-      'failed_count' : bigint,
     }
   >,
-  'get_claim_request' : ActorMethod<[ClaimRequestId], [] | [ClaimRequest]>,
   'get_claimed_positions_for_principal' : ActorMethod<
     [Principal],
     Array<ClaimedPosition>
+  >,
+  'get_completed_claim_requests' : ActorMethod<
+    [bigint, bigint],
+    Array<[] | [BufferEntry]>
+  >,
+  'get_completed_claim_requests_id_range' : ActorMethod<
+    [],
+    [] | [[bigint, bigint]]
   >,
   'get_error_entries' : ActorMethod<
     [bigint, bigint],
@@ -139,7 +149,7 @@ export interface SneedLock {
     [TokenType],
     Array<FullyQualifiedLock>
   >,
-  'get_my_claim_requests' : ActorMethod<[], Array<ClaimRequest>>,
+  'get_my_active_claim_requests' : ActorMethod<[], Array<ClaimRequest>>,
   'get_position_ownerships' : ActorMethod<
     [],
     Array<[SwapCanisterId, PositionId]>

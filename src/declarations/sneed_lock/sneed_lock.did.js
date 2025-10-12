@@ -30,30 +30,6 @@ export const idlFactory = ({ IDL }) => {
   });
   const Dex = IDL.Nat;
   const TokenType = IDL.Principal;
-  const SwapCanisterId = IDL.Principal;
-  const PositionLock = IDL.Record({
-    'dex' : Dex,
-    'lock_id' : LockId,
-    'token0' : TokenType,
-    'token1' : TokenType,
-    'expiry' : Expiry,
-    'position_id' : PositionId,
-  });
-  const FullyQualifiedPositionLock = IDL.Tuple(
-    IDL.Principal,
-    SwapCanisterId,
-    PositionLock,
-  );
-  const Lock = IDL.Record({
-    'lock_id' : LockId,
-    'expiry' : Expiry,
-    'amount' : Balance,
-  });
-  const FullyQualifiedLock = IDL.Tuple(IDL.Principal, TokenType, Lock);
-  const QueueProcessingState = IDL.Variant({
-    'Paused' : IDL.Text,
-    'Active' : IDL.Null,
-  });
   const ClaimRequestStatus = IDL.Variant({
     'Failed' : IDL.Text,
     'ClaimVerified' : IDL.Record({
@@ -80,6 +56,7 @@ export const idlFactory = ({ IDL }) => {
       'balance0_before' : Balance,
     }),
   });
+  const SwapCanisterId = IDL.Principal;
   const ClaimRequest = IDL.Record({
     'request_id' : ClaimRequestId,
     'status' : ClaimRequestStatus,
@@ -91,6 +68,29 @@ export const idlFactory = ({ IDL }) => {
     'swap_canister_id' : SwapCanisterId,
     'completed_at' : IDL.Opt(Timestamp),
     'position_id' : PositionId,
+  });
+  const PositionLock = IDL.Record({
+    'dex' : Dex,
+    'lock_id' : LockId,
+    'token0' : TokenType,
+    'token1' : TokenType,
+    'expiry' : Expiry,
+    'position_id' : PositionId,
+  });
+  const FullyQualifiedPositionLock = IDL.Tuple(
+    IDL.Principal,
+    SwapCanisterId,
+    PositionLock,
+  );
+  const Lock = IDL.Record({
+    'lock_id' : LockId,
+    'expiry' : Expiry,
+    'amount' : Balance,
+  });
+  const FullyQualifiedLock = IDL.Tuple(IDL.Principal, TokenType, Lock);
+  const QueueProcessingState = IDL.Variant({
+    'Paused' : IDL.Text,
+    'Active' : IDL.Null,
   });
   const ClaimedPosition = IDL.Record({
     'owner' : IDL.Principal,
@@ -135,9 +135,13 @@ export const idlFactory = ({ IDL }) => {
   });
   const Subaccount = IDL.Vec(IDL.Nat8);
   const SneedLock = IDL.Service({
-    'admin_clear_completed_claim_requests' : IDL.Func([], [IDL.Nat], []),
+    'admin_clear_completed_claim_requests_buffer' : IDL.Func([], [IDL.Nat], []),
     'admin_pause_claim_queue' : IDL.Func([IDL.Text], [], []),
-    'admin_remove_claim_request' : IDL.Func([ClaimRequestId], [IDL.Bool], []),
+    'admin_remove_active_claim_request' : IDL.Func(
+        [ClaimRequestId],
+        [IDL.Bool],
+        [],
+      ),
     'admin_resume_claim_queue' : IDL.Func([], [], []),
     'admin_return_token' : IDL.Func(
         [IDL.Principal, IDL.Nat, IDL.Principal],
@@ -157,6 +161,11 @@ export const idlFactory = ({ IDL }) => {
         [CreateLockResult],
         [],
       ),
+    'get_active_claim_request' : IDL.Func(
+        [ClaimRequestId],
+        [IDL.Opt(ClaimRequest)],
+        ['query'],
+      ),
     'get_all_position_locks' : IDL.Func(
         [],
         [IDL.Vec(FullyQualifiedPositionLock)],
@@ -173,22 +182,26 @@ export const idlFactory = ({ IDL }) => {
           IDL.Record({
             'pending_count' : IDL.Nat,
             'processing_count' : IDL.Nat,
-            'completed_count' : IDL.Nat,
+            'active_total' : IDL.Nat,
+            'completed_buffer_count' : IDL.Nat,
             'processing_state' : QueueProcessingState,
-            'total_count' : IDL.Nat,
-            'failed_count' : IDL.Nat,
           }),
         ],
-        ['query'],
-      ),
-    'get_claim_request' : IDL.Func(
-        [ClaimRequestId],
-        [IDL.Opt(ClaimRequest)],
         ['query'],
       ),
     'get_claimed_positions_for_principal' : IDL.Func(
         [IDL.Principal],
         [IDL.Vec(ClaimedPosition)],
+        ['query'],
+      ),
+    'get_completed_claim_requests' : IDL.Func(
+        [IDL.Nat, IDL.Nat],
+        [IDL.Vec(IDL.Opt(BufferEntry))],
+        ['query'],
+      ),
+    'get_completed_claim_requests_id_range' : IDL.Func(
+        [],
+        [IDL.Opt(IDL.Tuple(IDL.Nat, IDL.Nat))],
         ['query'],
       ),
     'get_error_entries' : IDL.Func(
@@ -216,7 +229,11 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Vec(FullyQualifiedLock)],
         ['query'],
       ),
-    'get_my_claim_requests' : IDL.Func([], [IDL.Vec(ClaimRequest)], ['query']),
+    'get_my_active_claim_requests' : IDL.Func(
+        [],
+        [IDL.Vec(ClaimRequest)],
+        ['query'],
+      ),
     'get_position_ownerships' : IDL.Func(
         [],
         [IDL.Vec(IDL.Tuple(SwapCanisterId, PositionId))],

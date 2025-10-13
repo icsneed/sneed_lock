@@ -1427,6 +1427,32 @@ shared (deployer) persistent actor class SneedLock() = this {
     return result;
   };
 
+  public shared ({ caller }) func admin_return_token_from_failed_request(icrc1_ledger_canister_id: Principal, amount: Nat, recipient_principal : Principal) : async TransferResult {
+    if (not isAdmin(caller)) {
+      Debug.trap("Only the SNEED governance or Admin can return tokens.");
+    };
+
+    let icrc1_ledger_canister = actor (Principal.toText(icrc1_ledger_canister_id)) : actor {
+      icrc1_transfer(args : TransferArgs) : async T.TransferResult;
+    };
+
+    let user_account_to : Account = { owner = recipient_principal; subaccount = null; };
+
+    let sneed_fee_transfer_args : TransferArgs = {
+      from_subaccount = null;
+      to = user_account_to;
+      amount = amount;
+      fee = null;
+      memo = null;
+      created_at_time = null;
+    };  
+
+    let result = await icrc1_ledger_canister.icrc1_transfer(sneed_fee_transfer_args);
+    //log_info(caller, correlation_id, "Transferred Sneed lock fee. Args: " # debug_show(sneed_fee_transfer_args) # ", Result: " # debug_show(result));
+
+    return result;
+  };
+
 
   public shared ({ caller }) func set_token_lock_fee_sneed_e8s(new_token_lock_fee_sneed_e8s: Nat) : async SetLockFeeResult {    
     if (not isAdmin(caller)) {

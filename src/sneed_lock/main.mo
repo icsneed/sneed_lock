@@ -21,6 +21,60 @@ import CircularBuffer "CircularBuffer";
 //       https://internetcomputer.org/docs/current/motoko/main/writing-motoko/actor-classes
 
 // Migration expression to handle stable variable type changes
+(with migration = func (old : {
+  var stable_claim_requests : [T.ClaimRequestV2];
+  var completed_claim_requests : [T.ClaimRequestV2];
+  var failed_claim_requests : [T.ClaimRequestV2];
+}) : {
+  var stable_claim_requests : [T.ClaimRequest];
+  var completed_claim_requests : [T.ClaimRequest];
+  var failed_claim_requests : [T.ClaimRequest];
+} {
+  // Migrate each request by converting status from old to new type
+  let migrateRequest = func (oldReq : T.ClaimRequestV2) : T.ClaimRequest {
+    let newStatus = switch (oldReq.status) {
+      case (#Pending) { #Pending };
+      case (#Processing) { #Processing };
+      case (#BalanceRecorded(data)) { #BalanceRecorded(data) };
+      case (#ClaimAttempted(data)) { #ClaimAttempted(data) };
+      case (#ClaimVerified(data)) { #ClaimVerified(data) };
+      case (#Withdrawn(data)) { #Withdrawn(data) };
+      case (#Completed) {
+        // Old completed requests don't have transaction details, use defaults
+        #Completed({
+          amount0_claimed = 0;
+          amount1_claimed = 0;
+          amount0_transferred = 0;
+          amount1_transferred = 0;
+          transfer0_tx_id = null;
+          transfer1_tx_id = null;
+        })
+      };
+      case (#Failed(msg)) { #Failed(msg) };
+      case (#TimedOut) { #TimedOut };
+    };
+    {
+      request_id = oldReq.request_id;
+      caller = oldReq.caller;
+      swap_canister_id = oldReq.swap_canister_id;
+      position_id = oldReq.position_id;
+      token0 = oldReq.token0;
+      token1 = oldReq.token1;
+      status = newStatus;
+      created_at = oldReq.created_at;
+      started_processing_at = oldReq.started_processing_at;
+      completed_at = oldReq.completed_at;
+      retry_count = oldReq.retry_count;
+      last_attempted_at = oldReq.last_attempted_at;
+    }
+  };
+
+  {
+    var stable_claim_requests = Array.map<T.ClaimRequestV2, T.ClaimRequest>(old.stable_claim_requests, migrateRequest);
+    var completed_claim_requests = Array.map<T.ClaimRequestV2, T.ClaimRequest>(old.completed_claim_requests, migrateRequest);
+    var failed_claim_requests = Array.map<T.ClaimRequestV2, T.ClaimRequest>(old.failed_claim_requests, migrateRequest);
+  }
+})
 
 shared (deployer) persistent actor class SneedLock() = this {
 
@@ -63,8 +117,10 @@ shared (deployer) persistent actor class SneedLock() = this {
   type TransferTokenLockOwnershipResult = T.TransferTokenLockOwnershipResult;
   type TransferTokenLockOwnershipError = T.TransferTokenLockOwnershipError;
   type ClaimRequestId = T.ClaimRequestId;
+  type ClaimRequestStatusV2 = T.ClaimRequestStatusV2;  // Old version for migration
   type ClaimRequestStatus = T.ClaimRequestStatus;
   type ClaimRequestV1 = T.ClaimRequestV1;  // Old version for migration
+  type ClaimRequestV2 = T.ClaimRequestV2;  // Old version for migration
   type ClaimRequest = T.ClaimRequest;
   type ClaimAndWithdrawResult = T.ClaimAndWithdrawResult;
   type QueueProcessingState = T.QueueProcessingState;

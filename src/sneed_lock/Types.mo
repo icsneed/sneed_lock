@@ -182,7 +182,14 @@ module {
         #ClaimAttempted : { balance0_before: Balance; balance1_before: Balance; claim_attempt: Nat };
         #ClaimVerified : { balance0_before: Balance; balance1_before: Balance; amount0_claimed: Balance; amount1_claimed: Balance };
         #Withdrawn : { amount0_claimed: Balance; amount1_claimed: Balance };
-        #Completed;
+        #Completed : { 
+            amount0_claimed: Balance; 
+            amount1_claimed: Balance; 
+            amount0_transferred: Balance;
+            amount1_transferred: Balance;
+            transfer0_tx_id: ?Nat; 
+            transfer1_tx_id: ?Nat;
+        };
         #Failed : Text;
         #TimedOut;
     };

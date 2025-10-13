@@ -1942,6 +1942,8 @@ shared (deployer) persistent actor class SneedLock() = this {
     
     var transferred0 : Nat = 0;
     var transferred1 : Nat = 0;
+    var transfer0_tx_id : ?Nat = null;
+    var transfer1_tx_id : ?Nat = null;
     var transfer_errors : Text = "";
 
     // Transfer token0 if claimed amount is sufficient (need to cover transfer fee)
@@ -1960,9 +1962,10 @@ shared (deployer) persistent actor class SneedLock() = this {
       
       let transfer0_result = await token0_ledger.icrc1_transfer(transfer0_args);
       switch (transfer0_result) {
-        case (#Ok(_)) {
+        case (#Ok(tx_id)) {
           transferred0 := transfer0_amount;
-          log_info(request.caller, correlation_id, "Transferred token0 to user: " # debug_show(transfer0_amount));
+          transfer0_tx_id := ?tx_id;
+          log_info(request.caller, correlation_id, "Transferred token0 to user: " # debug_show(transfer0_amount) # ", tx_id: " # debug_show(tx_id));
         };
         case (#Err(err)) {
           let error_msg = "Failed to transfer token0 to user: " # debug_show(err);
@@ -1992,9 +1995,10 @@ shared (deployer) persistent actor class SneedLock() = this {
       
       let transfer1_result = await token1_ledger.icrc1_transfer(transfer1_args);
       switch (transfer1_result) {
-        case (#Ok(_)) {
+        case (#Ok(tx_id)) {
           transferred1 := transfer1_amount;
-          log_info(request.caller, correlation_id, "Transferred token1 to user: " # debug_show(transfer1_amount));
+          transfer1_tx_id := ?tx_id;
+          log_info(request.caller, correlation_id, "Transferred token1 to user: " # debug_show(transfer1_amount) # ", tx_id: " # debug_show(tx_id));
         };
         case (#Err(err)) {
           let error_msg = "Failed to transfer token1 to user: " # debug_show(err);
@@ -2017,10 +2021,17 @@ shared (deployer) persistent actor class SneedLock() = this {
       return;
     };
 
-    // Mark as completed
+    // Mark as completed with transfer details
     let completed_request = {
       updated_request_verified with
-      status = #Completed;
+      status = #Completed({
+        amount0_claimed = amount0_claimed;
+        amount1_claimed = amount1_claimed;
+        amount0_transferred = transferred0;
+        amount1_transferred = transferred1;
+        transfer0_tx_id = transfer0_tx_id;
+        transfer1_tx_id = transfer1_tx_id;
+      });
       completed_at = ?TimeAsNat64(Time.now());
     };
     archive_completed_request(completed_request);
@@ -2302,7 +2313,7 @@ shared (deployer) persistent actor class SneedLock() = this {
           case (#ClaimAttempted(_)) { false };
           case (#ClaimVerified(_)) { false };
           case (#Withdrawn(_)) { false };
-          case (#Completed) { false };
+          case (#Completed(_)) { false };
         };
 
         if (not is_retryable) {

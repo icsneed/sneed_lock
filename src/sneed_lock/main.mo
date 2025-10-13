@@ -1813,19 +1813,20 @@ shared (deployer) persistent actor class SneedLock() = this {
     // Get ICPSwap swap canister actor
     let swap_canister = actor (Principal.toText(request.swap_canister_id)) : actor {
       claim : (args : { positionId : Nat }) -> async { #ok : { amount0 : Nat; amount1 : Nat }; #err : T.SwapCanisterError };
-      getUserUnusedBalance : (principal : Principal) -> async { #ok : { balance0 : Nat; balance1 : Nat }; #err : T.SwapCanisterError };
       getUserPosition : (positionId : Nat) -> async { #ok : { tokensOwed0 : Nat; tokensOwed1 : Nat; liquidity : Nat; feeGrowthInside0LastX128 : Nat; feeGrowthInside1LastX128 : Nat }; #err : T.SwapCanisterError };
-      withdrawToSubaccount : (args : {
-        amount : Nat;
-        fee : Nat;
-        subaccount : Blob;
-        token : Text;
-      }) -> async { #ok : Nat; #err : T.SwapCanisterError };
     };
 
-    // Step 0: Get token fees and check if there's enough to claim
-    let token0_ledger = actor (Principal.toText(request.token0)) : actor { icrc1_fee : () -> async Nat };
-    let token1_ledger = actor (Principal.toText(request.token1)) : actor { icrc1_fee : () -> async Nat };
+    // Step 0: Get token ledger actors and fees
+    let token0_ledger = actor (Principal.toText(request.token0)) : actor { 
+      icrc1_fee : () -> async Nat;
+      icrc1_balance_of : (account : Account) -> async Nat;
+      icrc1_transfer : (args : TransferArgs) -> async T.TransferResult;
+    };
+    let token1_ledger = actor (Principal.toText(request.token1)) : actor { 
+      icrc1_fee : () -> async Nat;
+      icrc1_balance_of : (account : Account) -> async Nat;
+      icrc1_transfer : (args : TransferArgs) -> async T.TransferResult;
+    };
     let token0_fee = await token0_ledger.icrc1_fee();
     let token1_fee = await token1_ledger.icrc1_fee();
 
@@ -1842,12 +1843,12 @@ shared (deployer) persistent actor class SneedLock() = this {
       };
     };
 
-    // Check if at least one token has enough to claim (need at least 2x fee: 1x for claim, 1x for withdraw)
-    let token0_has_enough = tokens_owed0 >= (2 * token0_fee);
-    let token1_has_enough = tokens_owed1 >= (2 * token1_fee);
+    // Check if at least one token has enough to claim (need at least 1x fee for transfer to user)
+    let token0_has_enough = tokens_owed0 >= token0_fee;
+    let token1_has_enough = tokens_owed1 >= token1_fee;
 
     if (not token0_has_enough and not token1_has_enough) {
-      let error_msg = "Insufficient rewards to claim. Token0: " # debug_show(tokens_owed0) # " (need >= " # debug_show(2 * token0_fee) # "), Token1: " # debug_show(tokens_owed1) # " (need >= " # debug_show(2 * token1_fee) # ")";
+      let error_msg = "Insufficient rewards to claim. Token0: " # debug_show(tokens_owed0) # " (need >= " # debug_show(token0_fee) # "), Token1: " # debug_show(tokens_owed1) # " (need >= " # debug_show(token1_fee) # ")";
       log_error(request.caller, correlation_id, error_msg);
       let failed_request = { updated_request_processing with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
       archive_failed_request(failed_request);  // Pre-claim failure, no funds stuck
@@ -1856,35 +1857,13 @@ shared (deployer) persistent actor class SneedLock() = this {
 
     log_info(request.caller, correlation_id, "Position has claimable rewards - Token0: " # debug_show(tokens_owed0) # " (fee: " # debug_show(token0_fee) # ", enough: " # debug_show(token0_has_enough) # "), Token1: " # debug_show(tokens_owed1) # " (fee: " # debug_show(token1_fee) # ", enough: " # debug_show(token1_has_enough) # ")");
 
-    // Step 1: Record balance before claim
-    let balance_result = await swap_canister.getUserUnusedBalance(this_canister_id());
-    let (balance0_before, balance1_before) = switch (balance_result) {
-      case (#ok(balances)) { (balances.balance0, balances.balance1) };
-      case (#err(err)) {
-        let error_msg = "Failed to get balance before claim: " # debug_show(err);
-        log_error(request.caller, correlation_id, error_msg);
-        let failed_request = { updated_request_processing with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-        archive_failed_request(failed_request);  // Pre-claim failure, no funds stuck
-        return;
-      };
-    };
-
-    // Safety check: Balance should be zero if enforced (indicates previous claims were fully withdrawn)
-    if (enforce_zero_balance_before_claim) {
-      if (balance0_before != 0 or balance1_before != 0) {
-        let error_msg = "Safety check failed: Backend balance is not zero before claim. Token0: " # debug_show(balance0_before) # ", Token1: " # debug_show(balance1_before) # ". This indicates incomplete withdrawal from a previous claim.";
-        log_error(request.caller, correlation_id, error_msg);
-        let failed_request = { updated_request_processing with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-        archive_failed_request(failed_request);  // Pre-claim failure, no funds stuck
-        
-        // Pause processing to prevent further issues
-        claim_queue_processing_state := #Paused("Non-zero balance detected before claim");
-        return;
-      };
-      log_info(request.caller, correlation_id, "Safety check passed: Balance is zero before claim");
-    } else {
-      log_info(request.caller, correlation_id, "Safety check disabled: Balance before claim - Token0: " # debug_show(balance0_before) # ", Token1: " # debug_show(balance1_before));
-    };
+    // Step 1: Record balance on token ledgers before claim
+    // Note: ICPSwap's claim() auto-withdraws to the caller's principal (sneed_lock), not to a subaccount
+    let canister_account : Account = { owner = this_canister_id(); subaccount = null };
+    let balance0_before = await token0_ledger.icrc1_balance_of(canister_account);
+    let balance1_before = await token1_ledger.icrc1_balance_of(canister_account);
+    
+    log_info(request.caller, correlation_id, "Balance before claim on sneed_lock principal: token0=" # debug_show(balance0_before) # ", token1=" # debug_show(balance1_before));
 
     let updated_request_balance_recorded = {
       updated_request_processing with
@@ -1902,47 +1881,49 @@ shared (deployer) persistent actor class SneedLock() = this {
     };
     update_claim_request(updated_request_claim_attempted);
 
-    let (amount0_claimed, amount1_claimed) = switch (claim_result) {
+    // Step 3: Verify claim by checking balance change on token ledgers
+    // ICPSwap's claim auto-withdraws to the caller (sneed_lock principal), so we check ledger balances
+    let balance0_after = await token0_ledger.icrc1_balance_of(canister_account);
+    let balance1_after = await token1_ledger.icrc1_balance_of(canister_account);
+    
+    let amount0_claimed = if (balance0_after >= balance0_before) {
+      balance0_after - balance0_before
+    } else { 
+      log_error(request.caller, correlation_id, "WARNING: Token0 balance decreased after claim! Before: " # debug_show(balance0_before) # ", After: " # debug_show(balance0_after));
+      0 
+    };
+    let amount1_claimed = if (balance1_after >= balance1_before) {
+      balance1_after - balance1_before
+    } else { 
+      log_error(request.caller, correlation_id, "WARNING: Token1 balance decreased after claim! Before: " # debug_show(balance1_before) # ", After: " # debug_show(balance1_after));
+      0 
+    };
+    
+    // Verify claim based on balance changes
+    let claim_error = switch (claim_result) {
       case (#ok(amounts)) {
-        log_info(request.caller, correlation_id, "Claim succeeded: amount0=" # debug_show(amounts.amount0) # ", amount1=" # debug_show(amounts.amount1));
-        (amounts.amount0, amounts.amount1)
+        log_info(request.caller, correlation_id, "Claim API returned success: amount0=" # debug_show(amounts.amount0) # ", amount1=" # debug_show(amounts.amount1) # ". Actual balance change: token0=" # debug_show(amount0_claimed) # ", token1=" # debug_show(amount1_claimed));
+        null
       };
       case (#err(err)) {
-        // Claim failed, check if balance changed
-        log_info(request.caller, correlation_id, "Claim returned error: " # debug_show(err) # ", checking balance");
-        let balance_after_result = await swap_canister.getUserUnusedBalance(this_canister_id());
-        switch (balance_after_result) {
-          case (#ok(balances_after)) {
-            let balance_change0 = if (balances_after.balance0 >= balance0_before) {
-              balances_after.balance0 - balance0_before
-            } else { 0 };
-            let balance_change1 = if (balances_after.balance1 >= balance1_before) {
-              balances_after.balance1 - balance1_before
-            } else { 0 };
-
-            if (balance_change0 == 0 and balance_change1 == 0) {
-              // Balance didn't change, claim truly failed
-              let error_msg = "Claim failed and balance unchanged: " # debug_show(err);
-              log_error(request.caller, correlation_id, error_msg);
-              let failed_request = { updated_request_claim_attempted with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-              archive_failed_request(failed_request);  // Claim failed, verified no funds stuck
-              return;
-            } else {
-              // Balance changed, claim succeeded despite error
-              log_info(request.caller, correlation_id, "Claim succeeded (balance changed): amount0=" # debug_show(balance_change0) # ", amount1=" # debug_show(balance_change1));
-              (balance_change0, balance_change1)
-            };
-          };
-          case (#err(balance_err)) {
-            let error_msg = "Failed to verify balance after claim error: " # debug_show(balance_err);
-            log_error(request.caller, correlation_id, error_msg);
-            let failed_request = { updated_request_claim_attempted with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-            update_claim_request(failed_request);  // Keep in active array for retry
-            return;
-          };
-        };
+        log_info(request.caller, correlation_id, "Claim API returned error: " # debug_show(err) # ". Actual balance change: token0=" # debug_show(amount0_claimed) # ", token1=" # debug_show(amount1_claimed));
+        ?err
       };
     };
+    
+    // Check if any funds were actually claimed
+    if (amount0_claimed == 0 and amount1_claimed == 0) {
+      let error_msg = switch (claim_error) {
+        case (?err) { "Claim failed with no balance change: " # debug_show(err) };
+        case null { "Claim succeeded but no balance change detected" };
+      };
+      log_error(request.caller, correlation_id, error_msg);
+      let failed_request = { updated_request_claim_attempted with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+      archive_failed_request(failed_request);  // Claim failed, verified no funds stuck
+      return;
+    };
+    
+    log_info(request.caller, correlation_id, "Claim verified by balance change: token0=" # debug_show(amount0_claimed) # ", token1=" # debug_show(amount1_claimed));
 
     let updated_request_verified = {
       updated_request_claim_attempted with
@@ -1955,88 +1936,85 @@ shared (deployer) persistent actor class SneedLock() = this {
     };
     update_claim_request(updated_request_verified);
 
-    // Step 3: Withdraw to caller's subaccount
-    let caller_subaccount = PrincipalToSubaccount(request.caller);
+    // Step 4: Transfer claimed tokens to user's principal
+    // Funds are already on sneed_lock principal (auto-withdrawn by claim), so we use icrc1_transfer
+    let user_account : Account = { owner = request.caller; subaccount = null };
+    
+    var transferred0 : Nat = 0;
+    var transferred1 : Nat = 0;
+    var transfer_errors : Text = "";
 
-    // Query actual balance after claim to verify amounts available
-    let balance_after_claim = await swap_canister.getUserUnusedBalance(this_canister_id());
-    let (balance0_after_claim, balance1_after_claim) = switch (balance_after_claim) {
-      case (#ok(balances)) { 
-        log_info(request.caller, correlation_id, "Balance after claim: token0=" # debug_show(balances.balance0) # " (claimed: " # debug_show(amount0_claimed) # "), token1=" # debug_show(balances.balance1) # " (claimed: " # debug_show(amount1_claimed) # ")");
-        
-        // Check for discrepancies (ICPSwap claim might consume fees)
-        if (balances.balance0 != amount0_claimed) {
-          log_info(request.caller, correlation_id, "NOTE: Token0 balance (" # debug_show(balances.balance0) # ") differs from claimed amount (" # debug_show(amount0_claimed) # "), difference: " # debug_show(if (amount0_claimed > balances.balance0) { amount0_claimed - balances.balance0 } else { 0 }));
-        };
-        if (balances.balance1 != amount1_claimed) {
-          log_info(request.caller, correlation_id, "NOTE: Token1 balance (" # debug_show(balances.balance1) # ") differs from claimed amount (" # debug_show(amount1_claimed) # "), difference: " # debug_show(if (amount1_claimed > balances.balance1) { amount1_claimed - balances.balance1 } else { 0 }));
-        };
-        
-        (balances.balance0, balances.balance1) 
+    // Transfer token0 if claimed amount is sufficient (need to cover transfer fee)
+    if (amount0_claimed > token0_fee) {
+      let transfer0_amount = amount0_claimed - token0_fee;
+      log_info(request.caller, correlation_id, "Transferring token0 to user: amount=" # debug_show(transfer0_amount) # ", fee=" # debug_show(token0_fee) # ", claimed=" # debug_show(amount0_claimed));
+      
+      let transfer0_args : TransferArgs = {
+        from_subaccount = null;  // Transfer from sneed_lock's main account
+        to = user_account;
+        amount = transfer0_amount;
+        fee = ?token0_fee;
+        memo = null;
+        created_at_time = null;
       };
-      case (#err(err)) {
-        let error_msg = "Failed to get balance after claim: " # debug_show(err);
-        log_error(request.caller, correlation_id, error_msg);
-        let failed_request = { updated_request_verified with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-        update_claim_request(failed_request);  // Keep in active array for retry
-        return;
+      
+      let transfer0_result = await token0_ledger.icrc1_transfer(transfer0_args);
+      switch (transfer0_result) {
+        case (#Ok(_)) {
+          transferred0 := transfer0_amount;
+          log_info(request.caller, correlation_id, "Transferred token0 to user: " # debug_show(transfer0_amount));
+        };
+        case (#Err(err)) {
+          let error_msg = "Failed to transfer token0 to user: " # debug_show(err);
+          log_error(request.caller, correlation_id, error_msg);
+          transfer_errors := transfer_errors # error_msg # "; ";
+        };
       };
+    } else if (amount0_claimed > 0) {
+      let msg = "Token0 claimed amount (" # debug_show(amount0_claimed) # ") <= fee (" # debug_show(token0_fee) # "), cannot transfer";
+      log_info(request.caller, correlation_id, msg);
+      transfer_errors := transfer_errors # msg # "; ";
     };
 
-    // Withdraw token0 if balance is sufficient
-    // Use actual available balance instead of claimed amount, as claim might consume fees
-    if (balance0_after_claim > token0_fee) {
-      let withdraw0_amount = balance0_after_claim - token0_fee;
-      log_info(request.caller, correlation_id, "Attempting to withdraw token0: amount=" # debug_show(withdraw0_amount) # ", fee=" # debug_show(token0_fee) # ", total_needed=" # debug_show(balance0_after_claim) # ", available_balance=" # debug_show(balance0_after_claim) # ", claimed_was=" # debug_show(amount0_claimed));
+    // Transfer token1 if claimed amount is sufficient (need to cover transfer fee)
+    if (amount1_claimed > token1_fee) {
+      let transfer1_amount = amount1_claimed - token1_fee;
+      log_info(request.caller, correlation_id, "Transferring token1 to user: amount=" # debug_show(transfer1_amount) # ", fee=" # debug_show(token1_fee) # ", claimed=" # debug_show(amount1_claimed));
       
-      let withdraw0_result = await swap_canister.withdrawToSubaccount({
-        amount = withdraw0_amount;
-        fee = token0_fee;
-        subaccount = Blob.fromArray(caller_subaccount);
-        token = Principal.toText(request.token0);
-      });
-      switch (withdraw0_result) {
-        case (#ok(_)) {
-          log_info(request.caller, correlation_id, "Withdrew token0: " # debug_show(withdraw0_amount) # " (claimed: " # debug_show(amount0_claimed) # ", fee: " # debug_show(token0_fee) # ")");
+      let transfer1_args : TransferArgs = {
+        from_subaccount = null;  // Transfer from sneed_lock's main account
+        to = user_account;
+        amount = transfer1_amount;
+        fee = ?token1_fee;
+        memo = null;
+        created_at_time = null;
+      };
+      
+      let transfer1_result = await token1_ledger.icrc1_transfer(transfer1_args);
+      switch (transfer1_result) {
+        case (#Ok(_)) {
+          transferred1 := transfer1_amount;
+          log_info(request.caller, correlation_id, "Transferred token1 to user: " # debug_show(transfer1_amount));
         };
-        case (#err(err)) {
-          let error_msg = "Failed to withdraw token0: " # debug_show(err);
+        case (#Err(err)) {
+          let error_msg = "Failed to transfer token1 to user: " # debug_show(err);
           log_error(request.caller, correlation_id, error_msg);
-          let failed_request = { updated_request_verified with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-          update_claim_request(failed_request);  // Keep in active array for retry - FUNDS ARE STUCK ON BACKEND!
-          return;
+          transfer_errors := transfer_errors # error_msg # "; ";
         };
       };
-    } else if (balance0_after_claim > 0) {
-      log_info(request.caller, correlation_id, "Token0 available balance (" # debug_show(balance0_after_claim) # ") <= fee (" # debug_show(token0_fee) # "), skipping withdrawal (claimed was " # debug_show(amount0_claimed) # ")");
+    } else if (amount1_claimed > 0) {
+      let msg = "Token1 claimed amount (" # debug_show(amount1_claimed) # ") <= fee (" # debug_show(token1_fee) # "), cannot transfer";
+      log_info(request.caller, correlation_id, msg);
+      transfer_errors := transfer_errors # msg # "; ";
     };
-
-    // Withdraw token1 if balance is sufficient
-    // Use actual available balance instead of claimed amount, as claim might consume fees
-    if (balance1_after_claim > token1_fee) {
-      let withdraw1_amount = balance1_after_claim - token1_fee;
-      log_info(request.caller, correlation_id, "Attempting to withdraw token1: amount=" # debug_show(withdraw1_amount) # ", fee=" # debug_show(token1_fee) # ", total_needed=" # debug_show(balance1_after_claim) # ", available_balance=" # debug_show(balance1_after_claim) # ", claimed_was=" # debug_show(amount1_claimed));
-      
-      let withdraw1_result = await swap_canister.withdrawToSubaccount({
-        amount = withdraw1_amount;
-        fee = token1_fee;
-        subaccount = Blob.fromArray(caller_subaccount);
-        token = Principal.toText(request.token1);
-      });
-      switch (withdraw1_result) {
-        case (#ok(_)) {
-          log_info(request.caller, correlation_id, "Withdrew token1: " # debug_show(withdraw1_amount) # " (claimed: " # debug_show(amount1_claimed) # ", fee: " # debug_show(token1_fee) # ")");
-        };
-        case (#err(err)) {
-          let error_msg = "Failed to withdraw token1: " # debug_show(err);
-          log_error(request.caller, correlation_id, error_msg);
-          let failed_request = { updated_request_verified with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
-          update_claim_request(failed_request);  // Keep in active array for retry - FUNDS ARE STUCK ON BACKEND!
-          return;
-        };
-      };
-    } else if (balance1_after_claim > 0) {
-      log_info(request.caller, correlation_id, "Token1 available balance (" # debug_show(balance1_after_claim) # ") <= fee (" # debug_show(token1_fee) # "), skipping withdrawal (claimed was " # debug_show(amount1_claimed) # ")");
+    
+    // Check if transfers failed
+    if (transfer_errors != "") {
+      let error_msg = "Transfer errors: " # transfer_errors # " Tokens claimed but stuck on sneed_lock canister: token0=" # debug_show(amount0_claimed - transferred0) # ", token1=" # debug_show(amount1_claimed - transferred1);
+      log_error(request.caller, correlation_id, error_msg);
+      let failed_request = { updated_request_verified with status = #Failed(error_msg); completed_at = ?TimeAsNat64(Time.now()) };
+      update_claim_request(failed_request);  // Keep in active array - FUNDS ARE STUCK ON SNEED_LOCK!
+      return;
     };
 
     // Mark as completed

@@ -21,6 +21,20 @@ import CircularBuffer "CircularBuffer";
 //       https://internetcomputer.org/docs/current/motoko/main/writing-motoko/actor-classes
 
 // Migration expression to handle stable variable type changes
+(with migration = func (_old : { 
+  var completed_claim_requests_buffer : CircularBuffer.CircularBuffer;
+  var failed_claim_requests_buffer : CircularBuffer.CircularBuffer;
+}) : { 
+  var completed_claim_requests : [T.ClaimRequest];
+  var failed_claim_requests : [T.ClaimRequest];
+} {
+  {
+    // Old buffers contained text via debug_show(request), cannot parse back to ClaimRequest
+    // Initialize as empty arrays - going forward all completed/failed will be stored as structured data
+    var completed_claim_requests = [];
+    var failed_claim_requests = [];
+  }
+})
 
 shared (deployer) persistent actor class SneedLock() = this {
 
@@ -100,8 +114,8 @@ shared (deployer) persistent actor class SneedLock() = this {
   
   // Claim queue stable state
   stable var stable_claim_requests : StableClaimRequests = []; // Active requests (pending/processing)
-  stable var completed_claim_requests_buffer : CircularBuffer = CircularBuffer.CircularBufferLogic.create(1_000); // Completed requests circular buffer
-  stable var failed_claim_requests_buffer : CircularBuffer = CircularBuffer.CircularBufferLogic.create(1_000); // Failed requests circular buffer (pre-claim failures)
+  stable var completed_claim_requests : StableClaimRequests = []; // Completed requests with structured data
+  stable var failed_claim_requests : StableClaimRequests = []; // Failed requests with structured data (pre-claim failures)
   stable var next_claim_request_id : Nat = 0;
   stable var claim_queue_processing_state : QueueProcessingState = #Active;
   stable var claim_requests_processed_in_batch : Nat = 0;
@@ -1536,15 +1550,16 @@ shared (deployer) persistent actor class SneedLock() = this {
     };
   };
 
-  // Helper: Move completed request to circular buffer and remove from active
+  // Helper: Move completed request to array and remove from active
   private func archive_completed_request(request : ClaimRequest) : () {
-    // Add to completed buffer
-    CircularBuffer.CircularBufferLogic.add(
-      completed_claim_requests_buffer,
-      request.request_id,
-      request.caller,
-      debug_show(request)
-    );
+    // Add to completed requests array
+    completed_claim_requests := Array.append(completed_claim_requests, [request]);
+    
+    // Keep only last 1000 to prevent unbounded growth
+    if (completed_claim_requests.size() > 1000) {
+      let start_index = completed_claim_requests.size() - 1000;
+      completed_claim_requests := Array.subArray(completed_claim_requests, start_index, 1000);
+    };
 
     // Remove from active requests
     stable_claim_requests := Array.filter<ClaimRequest>(stable_claim_requests, func (req) {
@@ -1553,13 +1568,14 @@ shared (deployer) persistent actor class SneedLock() = this {
   };
 
   private func archive_failed_request(request : ClaimRequest) : () {
-    // Add to failed buffer (for pre-claim failures where no funds are stuck)
-    CircularBuffer.CircularBufferLogic.add(
-      failed_claim_requests_buffer,
-      request.request_id,
-      request.caller,
-      debug_show(request)
-    );
+    // Add to failed requests array (for pre-claim failures where no funds are stuck)
+    failed_claim_requests := Array.append(failed_claim_requests, [request]);
+    
+    // Keep only last 1000 to prevent unbounded growth
+    if (failed_claim_requests.size() > 1000) {
+      let start_index = failed_claim_requests.size() - 1000;
+      failed_claim_requests := Array.subArray(failed_claim_requests, start_index, 1000);
+    };
 
     // Remove from active requests
     stable_claim_requests := Array.filter<ClaimRequest>(stable_claim_requests, func (req) {
@@ -2031,74 +2047,14 @@ shared (deployer) persistent actor class SneedLock() = this {
     stable_claim_requests;
   };
 
-  // Query: Get all completed claim requests (from circular buffer, as Text)
-  public query func get_all_completed_claim_requests() : async [Text] {
-    var result : [Text] = [];
-    
-    // Get ID range
-    switch (CircularBuffer.CircularBufferLogic.get_id_range(completed_claim_requests_buffer)) {
-      case (?(start_id, end_id)) {
-        // Fetch all entries
-        let entries = CircularBuffer.CircularBufferLogic.get_entries_by_id(
-          completed_claim_requests_buffer,
-          start_id,
-          end_id - start_id + 1
-        );
-        
-        // Extract claim request text from entries
-        let requests = Array.mapFilter<?BufferEntry, Text>(
-          entries,
-          func(entry_opt) {
-            switch (entry_opt) {
-              case (?entry) { ?entry.content };
-              case null { null };
-            };
-          }
-        );
-        result := requests;
-      };
-      case null {
-        // Buffer is empty
-        result := [];
-      };
-    };
-    
-    result;
+  // Query: Get all completed claim requests (as structured data)
+  public query func get_all_completed_claim_requests() : async [ClaimRequest] {
+    completed_claim_requests;
   };
 
-  // Query: Get all failed claim requests (from circular buffer, as Text)
-  public query func get_all_failed_claim_requests() : async [Text] {
-    var result : [Text] = [];
-    
-    // Get ID range
-    switch (CircularBuffer.CircularBufferLogic.get_id_range(failed_claim_requests_buffer)) {
-      case (?(start_id, end_id)) {
-        // Fetch all entries
-        let entries = CircularBuffer.CircularBufferLogic.get_entries_by_id(
-          failed_claim_requests_buffer,
-          start_id,
-          end_id - start_id + 1
-        );
-        
-        // Extract claim request text from entries
-        let requests = Array.mapFilter<?BufferEntry, Text>(
-          entries,
-          func(entry_opt) {
-            switch (entry_opt) {
-              case (?entry) { ?entry.content };
-              case null { null };
-            };
-          }
-        );
-        result := requests;
-      };
-      case null {
-        // Buffer is empty
-        result := [];
-      };
-    };
-    
-    result;
+  // Query: Get all failed claim requests (as structured data)
+  public query func get_all_failed_claim_requests() : async [ClaimRequest] {
+    failed_claim_requests;
   };
 
   // Query: Get active claim request by ID (pending/processing)
@@ -2106,55 +2062,39 @@ shared (deployer) persistent actor class SneedLock() = this {
     Array.find<ClaimRequest>(stable_claim_requests, func (req) { req.request_id == request_id });
   };
 
-  // Query: Get claim request status by ID (searches both active and completed)
+  // Query: Get claim request status by ID (searches active, completed, and failed)
   public query func get_claim_request_status(request_id : ClaimRequestId) : async ?{
     #Active : ClaimRequest;
-    #Completed : Text; // The full request as debug text
-    #Failed : Text; // Failed requests (pre-claim failures)
+    #Completed : ClaimRequest;
+    #Failed : ClaimRequest;
   } {
     // First check active requests
     switch (Array.find<ClaimRequest>(stable_claim_requests, func (req) { req.request_id == request_id })) {
       case (?active_req) { return ?#Active(active_req); };
       case null {
-        // Search completed requests in circular buffer
-        let completed_entries = Array.freeze(CircularBuffer.CircularBufferLogic.to_array(completed_claim_requests_buffer));
-        for (entry_opt in completed_entries.vals()) {
-          switch (entry_opt) {
-            case (?entry) {
-              if (entry.id == request_id) {
-                return ?#Completed(entry.content);
-              };
+        // Search completed requests
+        switch (Array.find<ClaimRequest>(completed_claim_requests, func (req) { req.request_id == request_id })) {
+          case (?completed_req) { return ?#Completed(completed_req); };
+          case null {
+            // Search failed requests
+            switch (Array.find<ClaimRequest>(failed_claim_requests, func (req) { req.request_id == request_id })) {
+              case (?failed_req) { return ?#Failed(failed_req); };
+              case null { return null; };
             };
-            case null {};
           };
         };
-        
-        // Search failed requests in circular buffer
-        let failed_entries = Array.freeze(CircularBuffer.CircularBufferLogic.to_array(failed_claim_requests_buffer));
-        for (entry_opt in failed_entries.vals()) {
-          switch (entry_opt) {
-            case (?entry) {
-              if (entry.id == request_id) {
-                return ?#Failed(entry.content);
-              };
-            };
-            case null {};
-          };
-        };
-        
-        return null;
       };
     };
   };
 
-  // Query: Get completed claim requests from circular buffer
-  public query func get_completed_claim_requests(start: Nat, length: Nat) : async [?BufferEntry] {
-    CircularBuffer.CircularBufferLogic.get_entries_by_id(completed_claim_requests_buffer, start, length);
+  // Query: Get specific completed claim request by ID
+  public query func get_completed_claim_request(request_id : ClaimRequestId) : async ?ClaimRequest {
+    Array.find<ClaimRequest>(completed_claim_requests, func (req) { req.request_id == request_id });
   };
 
-  // Query: Get completed claim requests ID range
-  public query func get_completed_claim_requests_id_range() : async ?(Nat, Nat) {
-    CircularBuffer.CircularBufferLogic.get_id_range(completed_claim_requests_buffer);
+  // Query: Get specific failed claim request by ID
+  public query func get_failed_claim_request(request_id : ClaimRequestId) : async ?ClaimRequest {
+    Array.find<ClaimRequest>(failed_claim_requests, func (req) { req.request_id == request_id });
   };
 
   // Query: Get queue status
@@ -2163,8 +2103,8 @@ shared (deployer) persistent actor class SneedLock() = this {
     pending_count : Nat;
     processing_count : Nat;
     active_total : Nat;
-    completed_buffer_count : Nat;
-    failed_buffer_count : Nat;
+    completed_count : Nat;
+    failed_count : Nat;
     consecutive_empty_cycles : Nat;
   } {
     var pending = 0;
@@ -2187,8 +2127,8 @@ shared (deployer) persistent actor class SneedLock() = this {
       pending_count = pending;
       processing_count = processing;
       active_total = stable_claim_requests.size();
-      completed_buffer_count = completed_claim_requests_buffer.count;
-      failed_buffer_count = failed_claim_requests_buffer.count;
+      completed_count = completed_claim_requests.size();
+      failed_count = failed_claim_requests.size();
       consecutive_empty_cycles = consecutive_empty_processing_cycles;
     };
   };
@@ -2257,17 +2197,32 @@ shared (deployer) persistent actor class SneedLock() = this {
     log_info(caller, correlation_id, "EMERGENCY STOP: Queue processing paused, timer cancelled");
   };
 
-  // Admin: Clear completed requests circular buffer
-  public shared ({ caller }) func admin_clear_completed_claim_requests_buffer() : async Nat {
+  // Admin: Clear completed requests array
+  public shared ({ caller }) func admin_clear_completed_claim_requests() : async Nat {
     if (not isAdmin(caller)) {
-      Debug.trap("Only admin can clear completed requests buffer");
+      Debug.trap("Only admin can clear completed requests");
     };
 
-    let before_count = completed_claim_requests_buffer.count;
-    completed_claim_requests_buffer := CircularBuffer.CircularBufferLogic.create(1_000);
+    let before_count = completed_claim_requests.size();
+    completed_claim_requests := [];
 
     let correlation_id = get_next_correlation_id();
-    log_info(caller, correlation_id, "Cleared completed claim requests buffer, removed " # debug_show(before_count) # " entries");
+    log_info(caller, correlation_id, "Cleared completed claim requests, removed " # debug_show(before_count) # " entries");
+    
+    before_count;
+  };
+
+  // Admin: Clear failed requests array
+  public shared ({ caller }) func admin_clear_failed_claim_requests() : async Nat {
+    if (not isAdmin(caller)) {
+      Debug.trap("Only admin can clear failed requests");
+    };
+
+    let before_count = failed_claim_requests.size();
+    failed_claim_requests := [];
+
+    let correlation_id = get_next_correlation_id();
+    log_info(caller, correlation_id, "Cleared failed claim requests, removed " # debug_show(before_count) # " entries");
     
     before_count;
   };
@@ -2415,29 +2370,76 @@ shared (deployer) persistent actor class SneedLock() = this {
         #Ok("Request " # debug_show(request_id) # " reset to pending and queued for retry");
       };
       case null {
-        // Check if it's in the completed buffer
-        let buffer_entries = Array.freeze(CircularBuffer.CircularBufferLogic.to_array(completed_claim_requests_buffer));
-        var found_in_completed = false;
+        // Check completed requests
+        let completed_request_opt = Array.find<ClaimRequest>(completed_claim_requests, func (req) {
+          req.request_id == request_id
+        });
         
-        for (entry_opt in buffer_entries.vals()) {
-          switch (entry_opt) {
-            case (?entry) {
-              if (entry.id == request_id) {
-                found_in_completed := true;
-              };
-            };
-            case null {};
+        switch (completed_request_opt) {
+          case (?req) {
+            let msg = "Request " # debug_show(request_id) # " is completed. It cannot be retried. If funds are stuck (claim succeeded but withdrawal failed), please use admin_manual_withdraw_for_request(" # debug_show(request_id) # ") to rescue them.";
+            log_info(caller, correlation_id, msg);
+            return #Err(msg);
           };
+          case null {};
         };
         
-        if (found_in_completed) {
-          let msg = "Request " # debug_show(request_id) # " is in the completed buffer. It cannot be automatically retried from there. If funds are stuck (claim succeeded but withdrawal failed), please use admin_manual_withdraw_for_request(" # debug_show(request_id) # ") to rescue them.";
-          log_info(caller, correlation_id, msg);
-          #Err(msg);
-        } else {
-          let msg = "Request " # debug_show(request_id) # " not found in active or completed requests.";
-          log_info(caller, correlation_id, msg);
-          #Err(msg);
+        // Check failed requests - these CAN be retried!
+        let failed_request_opt = Array.find<ClaimRequest>(failed_claim_requests, func (req) {
+          req.request_id == request_id
+        });
+        
+        switch (failed_request_opt) {
+          case (?failed_request) {
+            // Move from failed back to active with pending status
+            let retried_request : ClaimRequest = {
+              request_id = failed_request.request_id;
+              caller = failed_request.caller;
+              swap_canister_id = failed_request.swap_canister_id;
+              position_id = failed_request.position_id;
+              token0 = failed_request.token0;
+              token1 = failed_request.token1;
+              status = #Pending;
+              created_at = failed_request.created_at;
+              started_processing_at = null;
+              completed_at = null;
+              retry_count = 0;  // Reset retry count for manual retry
+              last_attempted_at = null;  // Clear cooldown
+            };
+            
+            // Add to active requests
+            stable_claim_requests := Array.append(stable_claim_requests, [retried_request]);
+            
+            // Remove from failed requests
+            failed_claim_requests := Array.filter<ClaimRequest>(failed_claim_requests, func (req) {
+              req.request_id != request_id
+            });
+            
+            log_info(caller, correlation_id, "Moved failed request " # debug_show(request_id) # " back to active queue with pending status");
+            
+            // Start queue processor if needed
+            switch (claim_queue_processing_state) {
+              case (#Active) {
+                switch (claim_processing_timer_id) {
+                  case null {
+                    ignore start_claim_queue_processor();
+                    log_info(caller, correlation_id, "Started queue processor for retried failed request");
+                  };
+                  case (?_) {}; // Already running
+                };
+              };
+              case (#Paused(reason)) {
+                log_info(caller, correlation_id, "Queue is paused (" # reason # "), request moved to active but not processing");
+              };
+            };
+            
+            return #Ok("Failed request " # debug_show(request_id) # " moved back to active queue for retry");
+          };
+          case null {
+            let msg = "Request " # debug_show(request_id) # " not found in active, completed, or failed requests.";
+            log_info(caller, correlation_id, msg);
+            return #Err(msg);
+          };
         };
       };
     };
@@ -2595,61 +2597,45 @@ shared (deployer) persistent actor class SneedLock() = this {
     log_info(caller, correlation_id, "Admin manual withdraw for request " # debug_show(request_id));
     
     // Search in active requests first
-    let request_opt = Array.find<ClaimRequest>(stable_claim_requests, func (req) {
+    let active_request_opt = Array.find<ClaimRequest>(stable_claim_requests, func (req) {
       req.request_id == request_id
     });
 
-    let request : ClaimRequest = switch (request_opt) {
+    let request : ClaimRequest = switch (active_request_opt) {
       case (?req) { 
         log_info(caller, correlation_id, "Found request in active requests");
         req 
       };
       case null {
-        // Not in active requests, search in completed buffer
-        let completed_entries = Array.freeze(CircularBuffer.CircularBufferLogic.to_array(completed_claim_requests_buffer));
-        var found_in_completed : ?BufferEntry = null;
+        // Not in active, search in completed requests
+        let completed_request_opt = Array.find<ClaimRequest>(completed_claim_requests, func (req) {
+          req.request_id == request_id
+        });
         
-        for (entry_opt in completed_entries.vals()) {
-          switch (entry_opt) {
-            case (?entry) {
-              if (entry.correlation_id == request_id) {
-                found_in_completed := ?entry;
+        switch (completed_request_opt) {
+          case (?req) {
+            log_info(caller, correlation_id, "Found request in completed requests");
+            req
+          };
+          case null {
+            // Search in failed requests
+            let failed_request_opt = Array.find<ClaimRequest>(failed_claim_requests, func (req) {
+              req.request_id == request_id
+            });
+            
+            switch (failed_request_opt) {
+              case (?req) {
+                log_info(caller, correlation_id, "Found request in failed requests");
+                req
+              };
+              case null {
+                let msg = "Request " # debug_show(request_id) # " not found in active, completed, or failed requests.";
+                log_error(caller, correlation_id, msg);
+                return #Err(msg);
               };
             };
-            case null {};
           };
         };
-        
-        switch (found_in_completed) {
-          case (?_entry) {
-            log_info(caller, correlation_id, "Found request in completed buffer, but cannot extract structured data from text. Searching failed buffer...");
-            // Continue to check failed buffer
-          };
-          case null {};
-        };
-        
-        // Search in failed buffer
-        let failed_entries = Array.freeze(CircularBuffer.CircularBufferLogic.to_array(failed_claim_requests_buffer));
-        var found_in_failed : ?BufferEntry = null;
-        
-        for (entry_opt in failed_entries.vals()) {
-          switch (entry_opt) {
-            case (?entry) {
-              if (entry.correlation_id == request_id) {
-                found_in_failed := ?entry;
-              };
-            };
-            case null {};
-          };
-        };
-        
-        let msg = "Request " # debug_show(request_id) # " not found in active requests. " #
-                  "Found in completed: " # debug_show(found_in_completed != null) # ", " #
-                  "Found in failed: " # debug_show(found_in_failed != null) # ". " #
-                  "Cannot withdraw from completed/failed buffers as request data is stored as text. " #
-                  "The request must be in active state or you need to use request details directly.";
-        log_error(caller, correlation_id, msg);
-        return #Err(msg);
       };
     };
 

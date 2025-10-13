@@ -21,20 +21,6 @@ import CircularBuffer "CircularBuffer";
 //       https://internetcomputer.org/docs/current/motoko/main/writing-motoko/actor-classes
 
 // Migration expression to handle stable variable type changes
-(with migration = func (_old : { 
-  var completed_claim_requests_buffer : CircularBuffer.CircularBuffer;
-  var failed_claim_requests_buffer : CircularBuffer.CircularBuffer;
-}) : { 
-  var completed_claim_requests : [T.ClaimRequest];
-  var failed_claim_requests : [T.ClaimRequest];
-} {
-  {
-    // Old buffers contained text via debug_show(request), cannot parse back to ClaimRequest
-    // Initialize as empty arrays - going forward all completed/failed will be stored as structured data
-    var completed_claim_requests = [];
-    var failed_claim_requests = [];
-  }
-})
 
 shared (deployer) persistent actor class SneedLock() = this {
 
@@ -2771,6 +2757,148 @@ shared (deployer) persistent actor class SneedLock() = this {
       };
     } else {
       let fail_msg = "Failed to withdraw anything. Errors: " # errors;
+      log_error(caller, correlation_id, fail_msg);
+      #Err(fail_msg);
+    };
+  };
+
+  // Admin: Emergency withdrawal from swap canister directly
+  // Use this for edge cases where funds are stuck outside the normal request flow
+  // Withdraws the entire backend balance (minus fees) to the specified recipient's subaccount
+  public shared ({ caller }) func admin_emergency_withdraw_from_swap(
+    swap_canister_id : T.SwapCanisterId,
+    token0 : TokenType,
+    token1 : TokenType,
+    recipient : Principal
+  ) : async {
+    #Ok : Text;
+    #Err : Text;
+  } {
+    if (not isAdmin(caller)) {
+      Debug.trap("Only admin can perform emergency withdrawals");
+    };
+
+    let correlation_id = get_next_correlation_id();
+    log_info(caller, correlation_id, "Admin emergency withdraw from swap=" # debug_show(swap_canister_id) # " to recipient=" # debug_show(recipient));
+
+    // Get ICPSwap swap canister actor
+    let swap_canister = actor (Principal.toText(swap_canister_id)) : actor {
+      getUserUnusedBalance : (principal : Principal) -> async { #ok : { balance0 : Nat; balance1 : Nat }; #err : T.SwapCanisterError };
+      withdrawToSubaccount : (args : {
+        amount : Nat;
+        fee : Nat;
+        subaccount : Blob;
+        token : Text;
+      }) -> async { #ok : Nat; #err : T.SwapCanisterError };
+    };
+    
+    // Get token ledger actors for fees
+    let token0_ledger = actor (Principal.toText(token0)) : actor { icrc1_fee : () -> async Nat };
+    let token1_ledger = actor (Principal.toText(token1)) : actor { icrc1_fee : () -> async Nat };
+    
+    let token0_fee = await token0_ledger.icrc1_fee();
+    let token1_fee = await token1_ledger.icrc1_fee();
+
+    log_info(caller, correlation_id, "Token fees: token0=" # debug_show(token0_fee) # ", token1=" # debug_show(token1_fee));
+
+    // Get current backend balance on swap canister
+    let balance_result = await swap_canister.getUserUnusedBalance(this_canister_id());
+    let (balance0, balance1) = switch (balance_result) {
+      case (#ok(balances)) { (balances.balance0, balances.balance1) };
+      case (#err(err)) {
+        let msg = "Failed to get backend balance from swap canister: " # debug_show(err);
+        log_error(caller, correlation_id, msg);
+        return #Err(msg);
+      };
+    };
+
+    log_info(caller, correlation_id, "Current backend balance on swap canister: token0=" # debug_show(balance0) # ", token1=" # debug_show(balance1));
+
+    // Check if there's anything to withdraw
+    if (balance0 == 0 and balance1 == 0) {
+      let msg = "No balance to withdraw. Backend has 0 tokens on the swap canister.";
+      log_info(caller, correlation_id, msg);
+      return #Ok(msg);
+    };
+
+    // Calculate subaccount for the recipient
+    let recipient_subaccount = PrincipalToSubaccount(recipient);
+
+    var withdrawn0 : Balance = 0;
+    var withdrawn1 : Balance = 0;
+    var errors : Text = "";
+
+    // Attempt to withdraw token0 if balance is sufficient (withdraw balance minus one fee)
+    if (balance0 > token0_fee) {
+      let withdraw0_amount = balance0 - token0_fee;
+      log_info(caller, correlation_id, "Attempting to withdraw token0: amount=" # debug_show(withdraw0_amount) # ", fee=" # debug_show(token0_fee));
+      
+      let withdraw0_result = await swap_canister.withdrawToSubaccount({
+        amount = withdraw0_amount;
+        fee = token0_fee;
+        subaccount = Blob.fromArray(recipient_subaccount);
+        token = Principal.toText(token0);
+      });
+      
+      switch (withdraw0_result) {
+        case (#ok(_)) {
+          withdrawn0 := withdraw0_amount;
+          log_info(caller, correlation_id, "Successfully withdrew token0: " # debug_show(withdraw0_amount));
+        };
+        case (#err(err)) {
+          let error_msg = "Failed to withdraw token0: " # debug_show(err);
+          log_error(caller, correlation_id, error_msg);
+          errors := errors # error_msg # "; ";
+        };
+      };
+    } else if (balance0 > 0) {
+      let msg = "Token0 balance (" # debug_show(balance0) # ") <= fee (" # debug_show(token0_fee) # "), skipping withdrawal";
+      log_info(caller, correlation_id, msg);
+      errors := errors # msg # "; ";
+    };
+
+    // Attempt to withdraw token1 if balance is sufficient (withdraw balance minus one fee)
+    if (balance1 > token1_fee) {
+      let withdraw1_amount = balance1 - token1_fee;
+      log_info(caller, correlation_id, "Attempting to withdraw token1: amount=" # debug_show(withdraw1_amount) # ", fee=" # debug_show(token1_fee));
+      
+      let withdraw1_result = await swap_canister.withdrawToSubaccount({
+        amount = withdraw1_amount;
+        fee = token1_fee;
+        subaccount = Blob.fromArray(recipient_subaccount);
+        token = Principal.toText(token1);
+      });
+      
+      switch (withdraw1_result) {
+        case (#ok(_)) {
+          withdrawn1 := withdraw1_amount;
+          log_info(caller, correlation_id, "Successfully withdrew token1: " # debug_show(withdraw1_amount));
+        };
+        case (#err(err)) {
+          let error_msg = "Failed to withdraw token1: " # debug_show(err);
+          log_error(caller, correlation_id, error_msg);
+          errors := errors # error_msg # "; ";
+        };
+      };
+    } else if (balance1 > 0) {
+      let msg = "Token1 balance (" # debug_show(balance1) # ") <= fee (" # debug_show(token1_fee) # "), skipping withdrawal";
+      log_info(caller, correlation_id, msg);
+      errors := errors # msg # "; ";
+    };
+
+    // Return result
+    if (withdrawn0 > 0 or withdrawn1 > 0) {
+      if (errors == "") {
+        let success_msg = "Successfully withdrew from swap canister: token0=" # debug_show(withdrawn0) # " (" # debug_show(token0) # "), token1=" # debug_show(withdrawn1) # " (" # debug_show(token1) # ") to recipient=" # debug_show(recipient);
+        log_info(caller, correlation_id, success_msg);
+        #Ok(success_msg);
+      } else {
+        let partial_msg = "Partially withdrew from swap canister: token0=" # debug_show(withdrawn0) # ", token1=" # debug_show(withdrawn1) # ". Errors: " # errors;
+        log_info(caller, correlation_id, partial_msg);
+        #Ok(partial_msg);
+      };
+    } else {
+      let fail_msg = "Failed to withdraw anything from swap canister. Errors: " # errors;
       log_error(caller, correlation_id, fail_msg);
       #Err(fail_msg);
     };

@@ -109,6 +109,7 @@ shared (deployer) persistent actor class SneedLock() = this {
   stable var last_timer_execution_time : ?T.Timestamp = null; // When timer last executed
   stable var last_timer_execution_correlation_id : ?Nat = null; // Correlation ID of last execution
   stable var consecutive_empty_processing_cycles : Nat = 0; // Circuit breaker: track empty processing cycles
+  stable var is_processing_claim_queue : Bool = false; // Semaphore: prevents concurrent execution of process_claim_queue
  
   // shouldn't be stable but is for legacy reasons. 
   stable var claim_processing_timer_id : ?Nat = null;
@@ -1667,6 +1668,15 @@ shared (deployer) persistent actor class SneedLock() = this {
   private func process_claim_queue() : async () {
     let correlation_id = get_next_correlation_id();
     
+    // SEMAPHORE: Check if already processing to prevent concurrent execution
+    if (is_processing_claim_queue) {
+      log_info(Principal.fromText("2vxsx-fae"), correlation_id, "Claim queue already processing, skipping this invocation");
+      return;
+    };
+    
+    // SEMAPHORE: Acquire lock
+    is_processing_claim_queue := true;
+    
     // Record execution
     last_timer_execution_time := ?TimeAsNat64(Time.now());
     last_timer_execution_correlation_id := ?correlation_id;
@@ -1677,6 +1687,7 @@ shared (deployer) persistent actor class SneedLock() = this {
         log_info(Principal.fromText("2vxsx-fae"), correlation_id, "Claim queue processing is paused: " # reason);
         claim_processing_timer_id := null;
         next_scheduled_timer_time := null;
+        is_processing_claim_queue := false; // SEMAPHORE: Release lock
         return;
       };
       case (#Active) {};
@@ -1702,6 +1713,7 @@ shared (deployer) persistent actor class SneedLock() = this {
             next_scheduled_timer_time := null;
             claim_requests_processed_in_batch := 0;
             consecutive_empty_processing_cycles := 0;
+            is_processing_claim_queue := false; // SEMAPHORE: Release lock
             return;
           };
           
@@ -1709,6 +1721,7 @@ shared (deployer) persistent actor class SneedLock() = this {
           let timer_id = Timer.setTimer<system>(#nanoseconds(Nat64.toNat(claim_request_cooldown_ns)), process_claim_queue);
           claim_processing_timer_id := ?timer_id;
           next_scheduled_timer_time := ?(TimeAsNat64(Time.now()) + claim_request_cooldown_ns);
+          is_processing_claim_queue := false; // SEMAPHORE: Release lock
           return;
         } else {
           // Queue is truly empty
@@ -1717,6 +1730,7 @@ shared (deployer) persistent actor class SneedLock() = this {
           next_scheduled_timer_time := null;
           claim_requests_processed_in_batch := 0;
           consecutive_empty_processing_cycles := 0;
+          is_processing_claim_queue := false; // SEMAPHORE: Release lock
           return;
         };
       };
@@ -1744,6 +1758,7 @@ shared (deployer) persistent actor class SneedLock() = this {
           claim_queue_processing_state := #Paused("Request " # debug_show(request.request_id) # " timed out");
           claim_processing_timer_id := null;
           next_scheduled_timer_time := null;
+          is_processing_claim_queue := false; // SEMAPHORE: Release lock
           return;
         };
 
@@ -1770,6 +1785,7 @@ shared (deployer) persistent actor class SneedLock() = this {
               let timer_id = Timer.setTimer<system>(#nanoseconds(Nat64.toNat(batch_pause_duration_ns)), process_claim_queue);
               claim_processing_timer_id := ?timer_id;
               next_scheduled_timer_time := ?(TimeAsNat64(Time.now()) + batch_pause_duration_ns);
+              is_processing_claim_queue := false; // SEMAPHORE: Release lock
               return;
             };
           };
@@ -1779,6 +1795,7 @@ shared (deployer) persistent actor class SneedLock() = this {
         let timer_id = Timer.setTimer<system>(#seconds(0), process_claim_queue);
         claim_processing_timer_id := ?timer_id;
         next_scheduled_timer_time := ?TimeAsNat64(Time.now()); // Immediate execution
+        is_processing_claim_queue := false; // SEMAPHORE: Release lock
       };
     };
   };
@@ -2107,6 +2124,7 @@ shared (deployer) persistent actor class SneedLock() = this {
     completed_count : Nat;
     failed_count : Nat;
     consecutive_empty_cycles : Nat;
+    is_currently_processing : Bool; // Semaphore state
   } {
     var pending = 0;
     var processing = 0;
@@ -2131,6 +2149,7 @@ shared (deployer) persistent actor class SneedLock() = this {
       completed_count = completed_claim_requests.size();
       failed_count = failed_claim_requests.size();
       consecutive_empty_cycles = consecutive_empty_processing_cycles;
+      is_currently_processing = is_processing_claim_queue;
     };
   };
 

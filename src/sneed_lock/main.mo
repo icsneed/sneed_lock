@@ -834,6 +834,9 @@ shared (deployer) persistent actor class SneedLock() = this {
           return error;
         };
 
+        // Clean up any expired locks first
+        clear_expired_locks_for_principal(caller, correlation_id);
+
         // Verify the caller's subaccount has the locked balance BEFORE making any mutations
         let icrc1_ledger_canister = actor (Principal.toText(token_type)) : actor {
           icrc1_transfer(args : TransferArgs) : async T.TransferResult;
@@ -845,9 +848,41 @@ shared (deployer) persistent actor class SneedLock() = this {
         let caller_account : T.Account = { owner = this_canister_id(); subaccount = ?Blob.fromArray(caller_subaccount); };
         let caller_balance = await icrc1_ledger_canister.icrc1_balance_of(caller_account);
 
+        // Get the transfer fee
+        let token_fee = await icrc1_ledger_canister.icrc1_fee();
+
+        // Calculate total locked balance for this token (this includes the lock being transferred)
+        let sum_locked = get_summed_locks_from_principal_and_token(caller, token_type);
+
+        // Check 1: Verify the locked balance is >= the amount being transferred
+        // This ensures the lock is legitimate and they actually have this amount locked
+        if (sum_locked < found_lock.amount) {
+          let error = #Err({
+            message = "Inconsistent lock state. Total locked: " # Nat.toText(sum_locked) # ", Lock amount: " # Nat.toText(found_lock.amount);
+            transfer_error = null;
+          });
+          log_error(caller, correlation_id, debug_show(error));
+          return error;
+        };
+
+        // Check 2: Verify they have at least the locked amount in their actual balance
         if (caller_balance < found_lock.amount) {
           let error = #Err({
             message = "Insufficient balance in caller's subaccount. Has: " # Nat.toText(caller_balance) # ", Required: " # Nat.toText(found_lock.amount);
+            transfer_error = null;
+          });
+          log_error(caller, correlation_id, debug_show(error));
+          return error;
+        };
+
+        // Check 3: Verify the free (unlocked) balance is >= one tx fee
+        // Free balance = total balance - total locked
+        // We need: caller_balance - sum_locked >= token_fee
+        // Which means: caller_balance >= sum_locked + token_fee
+        if (caller_balance < sum_locked + token_fee) {
+          let free_balance = if (caller_balance >= sum_locked) { caller_balance - sum_locked } else { 0 };
+          let error = #Err({
+            message = "Insufficient unlocked balance to cover transfer fee. Free balance: " # Nat.toText(free_balance) # ", Required fee: " # Nat.toText(token_fee) # " (Total: " # Nat.toText(caller_balance) # ", Locked: " # Nat.toText(sum_locked) # ")";
             transfer_error = null;
           });
           log_error(caller, correlation_id, debug_show(error));

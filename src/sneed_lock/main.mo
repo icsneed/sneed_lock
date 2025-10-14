@@ -865,17 +865,7 @@ shared (deployer) persistent actor class SneedLock() = this {
           return error;
         };
 
-        // Check 2: Verify they have at least the locked amount in their actual balance
-        if (caller_balance < found_lock.amount) {
-          let error = #Err({
-            message = "Insufficient balance in caller's subaccount. Has: " # Nat.toText(caller_balance) # ", Required: " # Nat.toText(found_lock.amount);
-            transfer_error = null;
-          });
-          log_error(caller, correlation_id, debug_show(error));
-          return error;
-        };
-
-        // Check 3: Verify the free (unlocked) balance is >= one tx fee
+        // Check 2: Verify the free (unlocked) balance is >= one tx fee
         // Free balance = total balance - total locked
         // We need: caller_balance - sum_locked >= token_fee
         // Which means: caller_balance >= sum_locked + token_fee

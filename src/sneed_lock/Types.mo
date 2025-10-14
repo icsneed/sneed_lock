@@ -40,6 +40,18 @@ module {
 
     public type LockId = Nat;
 
+    // Lock type discriminator
+    public type LockType = {
+        #TokenLock;
+        #PositionLock;
+    };
+
+    // Combined lock info that can be either type
+    public type LockInfo = {
+        #TokenLock : FullyQualifiedLock;
+        #PositionLock : FullyQualifiedPositionLock;
+    };
+
     // return types
     public type CreateLockError = {
         message : Text;

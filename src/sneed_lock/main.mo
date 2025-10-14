@@ -363,6 +363,99 @@ shared (deployer) persistent actor class SneedLock() = this {
     };
   };
 
+  // Private helper to determine lock type by lock_id
+  private func get_lock_type_impl(lock_id : T.LockId) : ?T.LockType {
+    // Check token lock archive first (O(1))
+    switch (archived_token_locks.get(lock_id)) {
+      case (?_) { return ?#TokenLock; };
+      case null {};
+    };
+
+    // Check position lock archive (O(1))
+    switch (archived_position_locks.get(lock_id)) {
+      case (?_) { return ?#PositionLock; };
+      case null {};
+    };
+
+    // Search active token locks (O(n))
+    for ((principal, token_locks_map) in state.principal_token_locks.entries()) {
+      for ((token_type, locks_list) in token_locks_map.entries()) {
+        let locks_iter = List.toIter(locks_list);
+        for (lock in locks_iter) {
+          if (lock.lock_id == lock_id) {
+            return ?#TokenLock;
+          };
+        };
+      };
+    };
+
+    // Search active position locks (O(n))
+    for ((principal, position_locks_map) in state.principal_position_locks.entries()) {
+      for ((swap_canister_id, position_locks_list) in position_locks_map.entries()) {
+        let locks_iter = List.toIter(position_locks_list);
+        for (position_lock in locks_iter) {
+          if (position_lock.lock_id == lock_id) {
+            return ?#PositionLock;
+          };
+        };
+      };
+    };
+
+    // Not found anywhere
+    null;
+  };
+
+  // Public query to get lock type by lock_id
+  public query func get_lock_type(lock_id : T.LockId) : async ?T.LockType {
+    get_lock_type_impl(lock_id);
+  };
+
+  // Public query to get any lock by lock_id (returns either token lock or position lock)
+  public query func get_lock_by_id(lock_id : T.LockId) : async ?T.LockInfo {
+    // Check token lock archive first (O(1))
+    switch (archived_token_locks.get(lock_id)) {
+      case (?archived) {
+        return ?#TokenLock(archived.owner, archived.token_type, archived.lock);
+      };
+      case null {};
+    };
+
+    // Check position lock archive (O(1))
+    switch (archived_position_locks.get(lock_id)) {
+      case (?archived) {
+        return ?#PositionLock(archived.owner, archived.swap_canister_id, archived.lock);
+      };
+      case null {};
+    };
+
+    // Search active token locks (O(n))
+    for ((principal, token_locks_map) in state.principal_token_locks.entries()) {
+      for ((token_type, locks_list) in token_locks_map.entries()) {
+        let locks_iter = List.toIter(locks_list);
+        for (lock in locks_iter) {
+          if (lock.lock_id == lock_id) {
+            return ?#TokenLock(principal, token_type, lock);
+          };
+        };
+      };
+    };
+
+    // Search active position locks (O(n))
+    for ((principal, position_locks_map) in state.principal_position_locks.entries()) {
+      for ((swap_canister_id, position_locks_list) in position_locks_map.entries()) {
+        let locks_iter = List.toIter(position_locks_list);
+        for (position_lock in locks_iter) {
+          if (position_lock.lock_id == lock_id) {
+            return ?#PositionLock(principal, swap_canister_id, position_lock);
+          };
+        };
+      };
+    };
+
+    // Not found anywhere
+    null;
+  };
+
   public shared ({ caller }) func clear_expired_position_locks() : async () {
     let correlation_id = get_next_correlation_id();
     log_info(caller, correlation_id, "Clearing expired position locks for " # debug_show(caller));

@@ -65,23 +65,34 @@ Principal → SwapCanisterId → List<PositionId>    (Position Ownerships)
 
 ### Token ID Encoding Scheme
 
-Since ICRC-7 supports **one collection per canister**, we must encode both lock types in a single token ID space:
+Since ICRC-7 supports **one collection per canister**, we must encode both lock types in a single token ID space using the **least significant bit (LSB)**:
 
 ```
 Token ID Structure:
-- Bit 63: Lock type flag (0 = Token Lock, 1 = Position Lock)
-- Bits 0-62: lock_id (original lock identifier)
+- LSB (bit 0): Lock type flag (0 = Token Lock, 1 = Position Lock)
+- Remaining bits: Derived from lock_id
 
-Token ID = (lock_type_bit << 63) | lock_id
+Encoding:
+  token_id = (lock_id * 2) + lock_type_bit
+
+Decoding:
+  lock_type_bit = token_id % 2
+  lock_id = token_id / 2
 
 Examples:
-- Token Lock with lock_id=123:     0x000000000000007B (123)
-- Position Lock with lock_id=123:  0x800000000000007B (9223372036854775931)
+- Token Lock with lock_id=123:     token_id = 246 (even)
+- Position Lock with lock_id=123:  token_id = 247 (odd)
+- Token Lock with lock_id=1:       token_id = 2 (even)
+- Position Lock with lock_id=1:    token_id = 3 (odd)
 ```
 
-This gives us:
-- ~9.2 quintillion token lock IDs (0 to 2^63-1)
-- ~9.2 quintillion position lock IDs (2^63 to 2^64-1)
+This approach:
+- Uses simple arithmetic (multiply/divide by 2)
+- Works with unbounded Nat values
+- Even numbers are always Token Locks
+- Odd numbers are always Position Locks
+- No bit manipulation needed
+- No size constraints
 
 ### ICRC-7 Method Mappings
 
@@ -108,8 +119,8 @@ icrc7_total_supply() -> count(token_locks) + count(position_locks)
 ```motoko
 icrc7_owner_of(token_ids: vec nat) -> vec opt Account
   For each token_id:
-    1. Decode: is_position_lock = (token_id >= 2^63)
-    2. Extract: lock_id = token_id & 0x7FFFFFFFFFFFFFFF
+    1. Decode: is_position_lock = (token_id % 2 == 1)
+    2. Extract: lock_id = token_id / 2
     3. If is_position_lock:
          - Iterate through principal_position_locks
          - Find lock with matching lock_id
@@ -361,16 +372,13 @@ public type ICRC7TokenId = Nat;
 
 // Helper functions in main.mo
 private func encode_token_id(is_position_lock: Bool, lock_id: LockId): Nat {
-  if (is_position_lock) {
-    lock_id | 0x8000000000000000  // Set bit 63
-  } else {
-    lock_id
-  }
+  let lock_type_bit : Nat = if (is_position_lock) 1 else 0;
+  (lock_id * 2) + lock_type_bit
 };
 
 private func decode_token_id(token_id: Nat): (Bool, LockId) {
-  let is_position_lock = token_id >= 0x8000000000000000;
-  let lock_id = token_id & 0x7FFFFFFFFFFFFFFF;
+  let is_position_lock = (token_id % 2) == 1;
+  let lock_id = token_id / 2;
   (is_position_lock, lock_id)
 };
 ```
@@ -398,6 +406,7 @@ stable var archived_token_locks_stable: [(LockId, ArchivedTokenLock)] = [];
 stable var archived_position_locks_stable: [(LockId, ArchivedPositionLock)] = [];
 
 // Add to ephemeral state
+// NOTE: Use Hash.hash (not Nat32.fromNat) to properly handle unbounded Nat values
 transient let archived_token_locks = HashMap.HashMap<LockId, ArchivedTokenLock>(1000, Nat.equal, Hash.hash);
 transient let archived_position_locks = HashMap.HashMap<LockId, ArchivedPositionLock>(1000, Nat.equal, Hash.hash);
 ```

@@ -5,7 +5,7 @@ import Iter "mo:base/Iter";
 import Time "mo:base/Time";
 import Nat "mo:base/Nat";
 import Nat64 "mo:base/Nat64";
-import Nat32 "mo:base/Nat32";
+import Hash "mo:base/Hash";
 import Int "mo:base/Int";
 import Array "mo:base/Array";
 import Nat8 "mo:base/Nat8";
@@ -142,8 +142,8 @@ shared (deployer) persistent actor class SneedLock() = this {
   };
 
   // Archive HashMaps (ephemeral, rebuilt from stable storage on upgrade)
-  transient let archived_token_locks = HashMap.HashMap<T.LockId, ArchivedTokenLock>(1000, Nat.equal, Nat32.fromNat);
-  transient let archived_position_locks = HashMap.HashMap<T.LockId, ArchivedPositionLock>(1000, Nat.equal, Nat32.fromNat);
+  transient let archived_token_locks = HashMap.HashMap<T.LockId, ArchivedTokenLock>(1000, Nat.equal, Hash.hash);
+  transient let archived_position_locks = HashMap.HashMap<T.LockId, ArchivedPositionLock>(1000, Nat.equal, Hash.hash);
 
   public query func get_token_lock_fee_sneed_e8s() : async Nat { token_lock_fee_sneed_e8s; };
 

@@ -5,6 +5,7 @@ import Iter "mo:base/Iter";
 import Time "mo:base/Time";
 import Nat "mo:base/Nat";
 import Nat64 "mo:base/Nat64";
+import Nat32 "mo:base/Nat32";
 import Int "mo:base/Int";
 import Array "mo:base/Array";
 import Nat8 "mo:base/Nat8";
@@ -69,6 +70,8 @@ shared (deployer) persistent actor class SneedLock() = this {
   type ClaimAndWithdrawResult = T.ClaimAndWithdrawResult;
   type QueueProcessingState = T.QueueProcessingState;
   type StableClaimRequests = T.StableClaimRequests;
+  type ArchivedTokenLock = T.ArchivedTokenLock;
+  type ArchivedPositionLock = T.ArchivedPositionLock;
 
   // consts
   transient let transaction_fee_sneed_e8s : Nat = 1000;
@@ -117,6 +120,10 @@ shared (deployer) persistent actor class SneedLock() = this {
   // Admin management
   stable var admin_list : [Principal] = []; // List of additional admin principals
   
+  // Archive storage - expired locks kept for history
+  stable var archived_token_locks_stable : T.StableArchivedTokenLocks = [];
+  stable var archived_position_locks_stable : T.StableArchivedPositionLocks = [];
+  
   // Ephemeral timer state (not stable - timer IDs don't persist across upgrades)
   transient var next_scheduled_timer_time : ?T.Timestamp = null;
 
@@ -133,6 +140,10 @@ shared (deployer) persistent actor class SneedLock() = this {
     public let principal_position_locks : HashMap.HashMap<Principal, T.PositionLockMap> = HashMap.HashMap<Principal, T.PositionLockMap>(100, Principal.equal, Principal.hash);
     public let principal_position_ownerships: T.PrincipalSwapPositionsMap = HashMap.HashMap<Principal, T.SwapPositionsMap>(100, Principal.equal, Principal.hash);
   };
+
+  // Archive HashMaps (ephemeral, rebuilt from stable storage on upgrade)
+  transient let archived_token_locks = HashMap.HashMap<T.LockId, ArchivedTokenLock>(1000, Nat.equal, Nat32.fromNat);
+  transient let archived_position_locks = HashMap.HashMap<T.LockId, ArchivedPositionLock>(1000, Nat.equal, Nat32.fromNat);
 
   public query func get_token_lock_fee_sneed_e8s() : async Nat { token_lock_fee_sneed_e8s; };
 
@@ -312,7 +323,7 @@ shared (deployer) persistent actor class SneedLock() = this {
       case _ HashMap.HashMap<T.SwapCanisterId, T.PositionLocks>(10, Principal.equal, Principal.hash);
     };
 
-    var cnt_cleared : Nat = 0;
+    var cnt_archived : Nat = 0;
     let swapIter : Iter.Iter<T.SwapCanisterId> = allPositionLocks.keys();
     for (swap in swapIter) {
       let positionLocks = switch (allPositionLocks.get(swap)) {
@@ -321,16 +332,37 @@ shared (deployer) persistent actor class SneedLock() = this {
       };
 
       let now = NowAsNat64();
-      let validPositionLocks = List.filter<T.PositionLock>(positionLocks, func (positionLock) {
-        positionLock.expiry > now
-      });
+      var expired_locks = List.nil<T.PositionLock>();
+      var valid_locks = List.nil<T.PositionLock>();
+      
+      // Separate expired and valid locks
+      let locks_iter = List.toIter(positionLocks);
+      for (lock in locks_iter) {
+        if (lock.expiry <= now) {
+          expired_locks := List.push(lock, expired_locks);
+        } else {
+          valid_locks := List.push(lock, valid_locks);
+        };
+      };
 
-      cnt_cleared += List.size(positionLocks) - List.size(validPositionLocks);      
-      allPositionLocks.put(swap, validPositionLocks);
+      // Archive expired locks
+      let expired_iter = List.toIter(expired_locks);
+      for (lock in expired_iter) {
+        let archived_lock : ArchivedPositionLock = {
+          lock = lock;
+          owner = principal;
+          swap_canister_id = swap;
+          archived_at = now;
+        };
+        archived_position_locks.put(lock.lock_id, archived_lock);
+        cnt_archived += 1;
+      };
+
+      allPositionLocks.put(swap, valid_locks);
     };
 
     state.principal_position_locks.put(principal, allPositionLocks);
-    log_info(principal, correlation_id, "Cleared " # debug_show(cnt_cleared) # " expired position locks for " # debug_show(principal));
+    log_info(principal, correlation_id, "Archived " # debug_show(cnt_archived) # " expired position locks for " # debug_show(principal));
   };
 
   public query ({ caller }) func has_expired_position_locks() : async Bool {
@@ -1161,7 +1193,7 @@ shared (deployer) persistent actor class SneedLock() = this {
     clear_expired_locks_for_principal(caller, correlation_id);
   };
 
-  // loop through all the locks for the principal and remove any that have expired
+  // loop through all the locks for the principal and archive any that have expired
   private func clear_expired_locks_for_principal(principal: Principal, correlation_id : Nat): () {
 
     let allLocks = switch (state.principal_token_locks.get(principal)) {
@@ -1169,7 +1201,7 @@ shared (deployer) persistent actor class SneedLock() = this {
       case _ HashMap.HashMap<TokenType, Locks>(10, Principal.equal, Principal.hash);
     };
 
-    var cnt_cleared : Nat = 0;
+    var cnt_archived : Nat = 0;
     let tokenIter : Iter.Iter<TokenType> = allLocks.keys();
     for (token in tokenIter) {
       let locks = switch (allLocks.get(token)) {
@@ -1178,16 +1210,37 @@ shared (deployer) persistent actor class SneedLock() = this {
       };
 
       let now = NowAsNat64();
-      let validLocks = List.filter<Lock>(locks, func (lock) {
-        lock.expiry > now
-      });
+      var expired_locks = List.nil<Lock>();
+      var valid_locks = List.nil<Lock>();
+      
+      // Separate expired and valid locks
+      let locks_iter = List.toIter(locks);
+      for (lock in locks_iter) {
+        if (lock.expiry <= now) {
+          expired_locks := List.push(lock, expired_locks);
+        } else {
+          valid_locks := List.push(lock, valid_locks);
+        };
+      };
 
-      cnt_cleared += List.size(locks) - List.size(validLocks);
-      allLocks.put(token, validLocks);
+      // Archive expired locks
+      let expired_iter = List.toIter(expired_locks);
+      for (lock in expired_iter) {
+        let archived_lock : ArchivedTokenLock = {
+          lock = lock;
+          owner = principal;
+          token_type = token;
+          archived_at = now;
+        };
+        archived_token_locks.put(lock.lock_id, archived_lock);
+        cnt_archived += 1;
+      };
+
+      allLocks.put(token, valid_locks);
     };
 
     state.principal_token_locks.put(principal, allLocks);
-    log_info(principal, correlation_id, "Cleared " # debug_show(cnt_cleared) # " expired position locks for " # debug_show(principal));
+    log_info(principal, correlation_id, "Archived " # debug_show(cnt_archived) # " expired token locks for " # debug_show(principal));
   };
 
   public query ({ caller }) func has_expired_locks(): async Bool {
@@ -2615,6 +2668,19 @@ shared (deployer) persistent actor class SneedLock() = this {
 
     /// stable_position_locks
     stable_position_locks := get_fully_qualified_position_locks();
+
+    /// archived locks
+    var archived_token_locks_list = List.nil<(T.LockId, ArchivedTokenLock)>();
+    for ((lock_id, archived_lock) in archived_token_locks.entries()) {
+      archived_token_locks_list := List.push((lock_id, archived_lock), archived_token_locks_list);
+    };
+    archived_token_locks_stable := List.toArray(archived_token_locks_list);
+
+    var archived_position_locks_list = List.nil<(T.LockId, ArchivedPositionLock)>();
+    for ((lock_id, archived_lock) in archived_position_locks.entries()) {
+      archived_position_locks_list := List.push((lock_id, archived_lock), archived_position_locks_list);
+    };
+    archived_position_locks_stable := List.toArray(archived_position_locks_list);
   };
 
   private func get_fully_qualified_locks() : [T.FullyQualifiedLock] {
@@ -2693,6 +2759,17 @@ shared (deployer) persistent actor class SneedLock() = this {
         add_position_lock_for_principal(posLock.0, posLock.1, posLock.2);
       };
       stable_position_locks := [];
+
+      /// archived locks
+      for ((lock_id, archived_lock) in archived_token_locks_stable.vals()) {
+        archived_token_locks.put(lock_id, archived_lock);
+      };
+      archived_token_locks_stable := [];
+
+      for ((lock_id, archived_lock) in archived_position_locks_stable.vals()) {
+        archived_position_locks.put(lock_id, archived_lock);
+      };
+      archived_position_locks_stable := [];
   };
 
   public query func get_token_position_locks(token_canister_id : T.TokenType) : async [T.FullyQualifiedPositionLock] {

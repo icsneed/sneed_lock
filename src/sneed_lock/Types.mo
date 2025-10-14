@@ -265,5 +265,22 @@ module {
     };
 
     public type StableClaimRequests = [ClaimRequest];
-    // TODO: this can give us guid/uuid??: https://github.com/aviate-labs/uuid.mo
+    
+    // Archive Types - For expired locks that are no longer active but kept for history
+    public type ArchivedTokenLock = {
+        lock: Lock;
+        owner: Principal;
+        token_type: TokenType;
+        archived_at: Timestamp;
+    };
+
+    public type ArchivedPositionLock = {
+        lock: PositionLock;
+        owner: Principal;
+        swap_canister_id: SwapCanisterId;
+        archived_at: Timestamp;
+    };
+
+    public type StableArchivedTokenLocks = [(LockId, ArchivedTokenLock)];
+    public type StableArchivedPositionLocks = [(LockId, ArchivedPositionLock)];
 };

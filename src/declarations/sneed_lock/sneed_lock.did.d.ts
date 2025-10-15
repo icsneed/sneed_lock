@@ -91,6 +91,10 @@ export interface Lock {
   'amount' : Balance,
 }
 export type LockId = bigint;
+export type LockInfo = { 'PositionLock' : FullyQualifiedPositionLock } |
+  { 'TokenLock' : FullyQualifiedLock };
+export type LockType = { 'PositionLock' : null } |
+  { 'TokenLock' : null };
 export type PositionId = bigint;
 export interface PositionLock {
   'dex' : Dex,
@@ -207,6 +211,8 @@ export interface SneedLock {
     [TokenType],
     Array<FullyQualifiedLock>
   >,
+  'get_lock_by_id' : ActorMethod<[LockId], [] | [LockInfo]>,
+  'get_lock_type' : ActorMethod<[LockId], [] | [LockType]>,
   'get_my_active_claim_requests' : ActorMethod<[], Array<ClaimRequest>>,
   'get_position_lock_by_id' : ActorMethod<
     [LockId],

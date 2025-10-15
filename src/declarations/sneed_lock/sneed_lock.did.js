@@ -114,6 +114,14 @@ export const idlFactory = ({ IDL }) => {
     'caller' : IDL.Principal,
     'correlation_id' : IDL.Nat,
   });
+  const LockInfo = IDL.Variant({
+    'PositionLock' : FullyQualifiedPositionLock,
+    'TokenLock' : FullyQualifiedLock,
+  });
+  const LockType = IDL.Variant({
+    'PositionLock' : IDL.Null,
+    'TokenLock' : IDL.Null,
+  });
   const ClaimAndWithdrawResult = IDL.Variant({
     'Ok' : ClaimRequestId,
     'Err' : IDL.Text,
@@ -308,6 +316,8 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Vec(FullyQualifiedLock)],
         ['query'],
       ),
+    'get_lock_by_id' : IDL.Func([LockId], [IDL.Opt(LockInfo)], ['query']),
+    'get_lock_type' : IDL.Func([LockId], [IDL.Opt(LockType)], ['query']),
     'get_my_active_claim_requests' : IDL.Func(
         [],
         [IDL.Vec(ClaimRequest)],

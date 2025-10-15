@@ -138,6 +138,8 @@ type SneedLock =
                                  });
    get_ledger_token_locks: (ledger_canister_id: TokenType) ->
     (vec FullyQualifiedLock) query;
+   get_lock_by_id: (lock_id: LockId) -> (opt LockInfo) query;
+   get_lock_type: (lock_id: LockId) -> (opt LockType) query;
    get_my_active_claim_requests: () -> (vec ClaimRequest) query;
    get_position_lock_by_id: (lock_id: LockId) ->
     (opt FullyQualifiedPositionLock) query;
@@ -211,6 +213,16 @@ type PositionLock =
    token1: TokenType;
  };
 type PositionId = nat;
+type LockType = 
+ variant {
+   PositionLock;
+   TokenLock;
+ };
+type LockInfo = 
+ variant {
+   PositionLock: FullyQualifiedPositionLock;
+   TokenLock: FullyQualifiedLock;
+ };
 type LockId = nat;
 type Lock = 
  record {
